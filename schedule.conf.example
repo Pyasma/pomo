@@ -1,0 +1,17 @@
+# pomo timetable. One block per line:
+#
+#   <days>  <start>  <minutes>  <focus>  <title>
+#
+#   days     daily | mon-fri | sat,sun | mon,wed,fri  (mon tue wed thu fri sat sun)
+#   start    HH:MM, 24h
+#   minutes  how long the whole block runs
+#   focus    length of each focus session inside the block
+#   title    what the notification says to do
+#
+# Blank lines and #comments are ignored. Edits apply on the next tick, no
+# restart needed. Check the day with:  pomo sched
+
+daily  11:00  150  50  Build app - practice project, no AI
+daily  14:30  120  50  Open source - land a PR
+daily  17:30  120  50  Reverse engineering - one binary
+daily  20:30   30  25  Write the X post about today's RE

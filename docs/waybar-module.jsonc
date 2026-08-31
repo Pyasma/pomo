@@ -1,0 +1,10 @@
+  "custom/pomodoro": {
+    "exec": "$HOME/.local/bin/pomo waybar",
+    "return-type": "json",
+    "interval": 1,
+    "signal": 11,
+    "format": "{}",
+    "on-click": "$HOME/.local/bin/pomo toggle",
+    "on-click-right": "$HOME/.local/bin/pomo menu",
+    "on-click-middle": "$HOME/.local/bin/pomo stop"
+  },

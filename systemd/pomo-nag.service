@@ -1,0 +1,6 @@
+[Unit]
+Description=Pomodoro idle nudge and due-task check
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/pomo nag

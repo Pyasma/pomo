@@ -1,0 +1,6 @@
+[Unit]
+Description=Pomodoro end-of-day summary
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/pomo daily

@@ -1,0 +1,1206 @@
+#!/bin/bash
+# pomo - pomodoro timer with task tracking, built for Omarchy/Hyprland.
+# State lives in ~/.local/share/pomo, config in ~/.config/pomo/config.env.
+
+set -uo pipefail
+
+SELF="$HOME/.local/bin/pomo"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/pomo"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pomo"
+CONF="$CONF_DIR/config.env"
+TASKS="$DATA/tasks.json"
+STATE="$DATA/state.json"
+LOG="$DATA/log.jsonl"
+
+mkdir -p "$DATA" "$CONF_DIR"
+[[ -f $TASKS ]] || echo '[]' >"$TASKS"
+[[ -f $STATE ]] || echo '{"phase":"idle","task":null,"ends_at":0,"left":0,"cycle":0,"started":0}' >"$STATE"
+[[ -f $LOG ]] || : >"$LOG"
+
+# Defaults, overridable in config.env
+WORK_MIN=25
+BREAK_MIN=5
+LONG_MIN=15
+CYCLES=4
+AUTO_BREAK=1
+AUTO_WORK=0
+NAG_MIN=30
+NTFY_SERVER=https://ntfy.sh
+NTFY_TOPIC=
+PUSH_ALL=0
+AGENDA_AT=08:00
+SOUND_END=/usr/share/sounds/freedesktop/stereo/complete.oga
+SOUND_START=/usr/share/sounds/freedesktop/stereo/message.oga
+SOUND_DUE=/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga
+WAYBAR_SIGNAL=11
+
+if [[ -f $CONF ]]; then
+  # shellcheck disable=SC1090
+  source "$CONF"
+else
+  cat >"$CONF" <<'CONFEOF'
+# pomo configuration. Values are shell variables.
+WORK_MIN=25
+BREAK_MIN=5
+LONG_MIN=15
+CYCLES=4          # work sessions before a long break
+AUTO_BREAK=1      # start break automatically when work ends
+AUTO_WORK=0       # start next work session automatically when break ends
+NAG_MIN=30        # minutes between idle nudges (0 disables)
+NTFY_SERVER=https://ntfy.sh
+NTFY_TOPIC=       # ntfy topic to mirror alerts to your phone (empty = off)
+PUSH_ALL=0        # 1 = push every notification, not just the urgent ones
+AGENDA_AT=08:00   # time of the "here is today" push (empty disables)
+SOUND_END=/usr/share/sounds/freedesktop/stereo/complete.oga
+SOUND_START=/usr/share/sounds/freedesktop/stereo/message.oga
+SOUND_DUE=/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga
+WAYBAR_SIGNAL=11
+CONFEOF
+fi
+
+now() { date +%s; }
+
+jset() {
+  local t
+  t=$(mktemp)
+  if jq "$@" "$STATE" >"$t" 2>/dev/null; then
+    mv "$t" "$STATE"
+  else
+    rm -f "$t"
+    echo "pomo: could not update state" >&2
+    return 1
+  fi
+}
+tset() {
+  local t
+  t=$(mktemp)
+  if jq "$@" "$TASKS" >"$t" 2>/dev/null; then
+    mv "$t" "$TASKS"
+  else
+    rm -f "$t"
+    echo "pomo: could not update tasks" >&2
+    return 1
+  fi
+}
+
+sget() { jq -r "$1" "$STATE"; }
+
+refresh_bar() { pkill -RTMIN+"$WAYBAR_SIGNAL" waybar 2>/dev/null; true; }
+
+play() {
+  local f=$1
+  [[ -f $f ]] || return 0
+  (paplay "$f" >/dev/null 2>&1 &) 2>/dev/null
+}
+
+# Mirror a notification to the phone over ntfy. Fire and forget: a dead network
+# must never hold up the timer.
+push() { # title body [urgency]
+  [[ -n ${NTFY_TOPIC:-} ]] || return 0
+  local prio=default
+  case "${3:-normal}" in
+  critical) prio=high ;;
+  low) prio=low ;;
+  esac
+  (curl -fsS -m 8 -X POST \
+    -H "Title: $1" -H "Priority: $prio" -H "Tags: tomato" \
+    -d "${2:-}" "${NTFY_SERVER%/}/$NTFY_TOPIC" >/dev/null 2>&1 &) 2>/dev/null
+  true
+}
+
+notify() { # title body [urgency] [sound]
+  notify-send -a Pomodoro -u "${3:-normal}" "$1" "${2:-}"
+  [[ -n ${4:-} ]] && play "$4"
+  if [[ ${PUSH_ALL:-0} == 1 || ${3:-normal} == critical ]]; then
+    push "$1" "${2:-}" "${3:-normal}"
+  fi
+  true
+}
+
+fmt_clock() { # seconds -> M:SS
+  local s=$1
+  ((s < 0)) && s=0
+  printf '%d:%02d' $((s / 60)) $((s % 60))
+}
+
+phase_seconds() {
+  case "$1" in
+  work) echo $((WORK_MIN * 60)) ;;
+  break) echo $((BREAK_MIN * 60)) ;;
+  long) echo $((LONG_MIN * 60)) ;;
+  *) echo 0 ;;
+  esac
+}
+
+phase_label() {
+  case "$1" in
+  work) echo "Focus" ;;
+  break) echo "Break" ;;
+  long) echo "Long break" ;;
+  paused) echo "Paused" ;;
+  *) echo "Idle" ;;
+  esac
+}
+
+# --- alarm scheduling -------------------------------------------------------
+
+cancel_alarm() {
+  systemctl --user stop pomo-alarm.timer >/dev/null 2>&1
+  systemctl --user stop pomo-alarm.service >/dev/null 2>&1
+  systemctl --user reset-failed pomo-alarm.timer pomo-alarm.service >/dev/null 2>&1
+  [[ -f $DATA/alarm.pid ]] && kill "$(cat "$DATA/alarm.pid")" 2>/dev/null
+  rm -f "$DATA/alarm.pid"
+  true
+}
+
+schedule_alarm() { # seconds from now
+  local secs=$1
+  cancel_alarm
+  if systemd-run --user --quiet --unit=pomo-alarm \
+    --on-active="$secs" --timer-property=AccuracySec=1s \
+    "$SELF" _fire >/dev/null 2>&1; then
+    return 0
+  fi
+  # Fallback when systemd user session is unavailable
+  setsid bash -c "sleep $secs; '$SELF' _fire" >/dev/null 2>&1 &
+  echo $! >"$DATA/alarm.pid"
+}
+
+# --- tasks ------------------------------------------------------------------
+
+# Accept "3" or "#3"; reject anything else so jq never sees junk.
+norm_id() {
+  local raw=${1-}
+  raw=${raw#\#}
+  raw=${raw//[[:space:]]/}
+  [[ $raw =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$raw"
+}
+
+task_exists() { jq -e --argjson id "$1" 'any(.[]; .id==$id)' "$TASKS" >/dev/null 2>&1; }
+
+# Print a validated, existing task id, or explain why not.
+require_id() {
+  local id
+  if ! id=$(norm_id "${1-}"); then
+    echo "bad task id: '${1-}' (want a number like 2 or #2)" >&2
+    return 1
+  fi
+  if ! task_exists "$id"; then
+    echo "no task #$id" >&2
+    return 1
+  fi
+  printf '%s' "$id"
+}
+
+is_num() { [[ ${1-} =~ ^[0-9]+$ ]]; }
+
+task_title() {
+  local id
+  id=$(norm_id "${1-}") || return 0
+  jq -r --argjson id "$id" '(.[]|select(.id==$id)|.title) // ""' "$TASKS"
+}
+
+next_task_id() {
+  jq -r 'map(select(.status=="active"))|sort_by(.due // 9999999999, .created)|(.[0].id // empty)' "$TASKS"
+}
+
+current_task() {
+  local id
+  id=$(sget '.task')
+  if [[ $id == null || -z $id ]]; then
+    id=$(next_task_id)
+  fi
+  [[ -z $id ]] && return 1
+  echo "$id"
+}
+
+parse_due() { # human time -> epoch or empty
+  local raw=$1 epoch
+  epoch=$(date -d "$raw" +%s 2>/dev/null) || return 1
+  echo "$epoch"
+}
+
+cmd_add() {
+  local title="" est=1 due="" wmin=null
+  while (($#)); do
+    case "$1" in
+    -e | --est)
+      est=$2
+      shift 2
+      ;;
+    -d | --due)
+      due=$2
+      shift 2
+      ;;
+    -m | --minutes)
+      wmin=$2
+      shift 2
+      ;;
+    *)
+      title+="${title:+ }$1"
+      shift
+      ;;
+    esac
+  done
+  [[ -z $title ]] && {
+    echo "usage: pomo add <title> [-e pomodoros] [-d 'due time'] [-m minutes]" >&2
+    return 1
+  }
+  local due_epoch=null
+  if [[ -n $due ]]; then
+    local e
+    if e=$(parse_due "$due"); then
+      due_epoch=$e
+    else
+      echo "could not parse due time: $due" >&2
+      return 1
+    fi
+  fi
+  local id
+  id=$(jq '[.[].id]|max // 0 | .+1' "$TASKS")
+  tset --argjson id "$id" --arg title "$title" --argjson est "$est" \
+    --argjson due "$due_epoch" --argjson now "$(now)" \
+    --argjson wmin "$wmin" \
+    '. + [{id:$id,title:$title,est:$est,done:0,status:"active",created:$now,due:$due,wmin:$wmin}]'
+  echo "added #$id  $title"
+  refresh_bar
+}
+
+cmd_ls() {
+  local all=0
+  [[ ${1:-} == "-a" || ${1:-} == "--all" ]] && all=1
+  local cur
+  cur=$(sget '.task')
+  jq -r --argjson all "$all" --argjson cur "${cur:-null}" '
+    map(select($all==1 or .status=="active"))
+    | sort_by(.status=="done", .due // 9999999999, .created)
+    | if length==0 then "no tasks. add one: pomo add \"write report\" -e 4" else
+      .[] | (if .id==$cur then "▸" else " " end)
+        + " #" + (.id|tostring)
+        + "  [" + (if .status=="done" then "x" else " " end) + "] "
+        + .title
+        + "  (" + (.done|tostring) + "/" + (.est|tostring) + ")"
+        + (if .wmin then "  " + (.wmin|tostring) + "m" else "" end)
+        + (if .due then "  due " + (.due|strflocaltime("%a %H:%M")) else "" end)
+      end' "$TASKS"
+}
+
+cmd_done() {
+  local id=${1:-}
+  if [[ -n ${id//[[:space:]]/} ]]; then
+    id=$(require_id "$id") || return 1
+  else
+    id=$(current_task) || id=""
+  fi
+  [[ -z $id ]] && {
+    echo "no task" >&2
+    return 1
+  }
+  local title
+  title=$(task_title "$id")
+  tset --argjson id "$id" 'map(if .id==$id then .status="done" else . end)'
+  [[ $(sget '.task') == "$id" ]] && jset '.task=null'
+  notify "󰄬  Task done" "$title" low
+  echo "done #$id  $title"
+  refresh_bar
+}
+
+cmd_rm() {
+  local id
+  id=$(require_id "${1-}") || {
+    echo "usage: pomo rm <id>" >&2
+    return 1
+  }
+  tset --argjson id "$id" 'map(select(.id!=$id))'
+  [[ $(sget '.task') == "$id" ]] && jset '.task=null'
+  echo "removed #$id"
+  refresh_bar
+}
+
+cmd_len() { # per-task focus length: pomo len <id> <minutes|default>
+  local id mins=${2-}
+  id=$(require_id "${1-}") || {
+    echo "usage: pomo len <id> <minutes|default>" >&2
+    return 1
+  }
+  if [[ $mins != default && $mins != "-" ]] && ! is_num "$mins"; then
+    echo "usage: pomo len <id> <minutes|default>" >&2
+    return 1
+  fi
+  if [[ $mins == default || $mins == "-" ]]; then
+    tset --argjson id "$id" 'map(if .id==$id then .wmin=null else . end)'
+    echo "#$id uses default ${WORK_MIN}m"
+  else
+    tset --argjson id "$id" --argjson m "$mins" 'map(if .id==$id then .wmin=$m else . end)'
+    echo "#$id focuses in ${mins}m blocks"
+  fi
+}
+
+cmd_use() { # set current task without starting
+  local id
+  id=$(require_id "${1-}") || {
+    echo "usage: pomo use <id>" >&2
+    return 1
+  }
+  jset --argjson id "$id" '.task=$id'
+  echo "current task: #$id  $(task_title "$id")"
+  refresh_bar
+}
+
+# --- timer ------------------------------------------------------------------
+
+begin_phase() { # phase [task_id] [seconds]
+  local phase=$1 task=${2:-null} secs=${3:-}
+  [[ -z $secs ]] && secs=$(phase_seconds "$phase")
+  jset --arg phase "$phase" --argjson task "${task:-null}" \
+    --argjson ends "$(($(now) + secs))" --argjson started "$(now)" \
+    '.phase=$phase | .task=(if $task==null then .task else $task end) | .ends_at=$ends | .left=0 | .started=$started'
+  schedule_alarm "$secs"
+  refresh_bar
+}
+
+cmd_start() {
+  local id="" mins=""
+  while (($#)); do
+    case "$1" in
+    -m | --minutes)
+      mins=$2
+      shift 2
+      ;;
+    *)
+      id=$1
+      shift
+      ;;
+    esac
+  done
+  if [[ -n ${mins//[[:space:]]/} ]] && ! is_num "$mins"; then
+    echo "bad minutes: '$mins'" >&2
+    return 1
+  fi
+  if [[ -n ${id//[[:space:]]/} ]]; then
+    id=$(require_id "$id") || return 1
+  else
+    id=$(current_task) || id=""
+  fi
+  if [[ -z $id ]]; then
+    notify "󰔟  No task" "Add one first: pomo add \"…\"" normal
+    echo "no active task. pomo add \"title\"" >&2
+    return 1
+  fi
+  # Precedence: -m flag, then the task's own length, then WORK_MIN
+  if [[ -z $mins ]]; then
+    mins=$(jq -r --argjson id "$id" '(.[]|select(.id==$id)|.wmin) // empty' "$TASKS")
+  fi
+  [[ -z $mins || $mins == null ]] && mins=$WORK_MIN
+  begin_phase work "$id" $((mins * 60))
+  notify "󰔟  Focus ${mins}m" "$(task_title "$id")" low "$SOUND_START"
+  echo "focus ${mins}m on #$id $(task_title "$id")"
+}
+
+cmd_break() { # manual break, optionally custom length
+  local mins=$BREAK_MIN
+  while (($#)); do
+    case "$1" in
+    -m | --minutes)
+      mins=$2
+      shift 2
+      ;;
+    *) shift ;;
+    esac
+  done
+  begin_phase break "" $((mins * 60))
+  notify "󰅶  Break ${mins}m" "" low "$SOUND_START"
+  echo "break ${mins}m"
+}
+
+cmd_pause() {
+  local phase left
+  phase=$(sget '.phase')
+  [[ $phase == idle || $phase == paused ]] && {
+    echo "not running"
+    return 0
+  }
+  left=$(($(sget '.ends_at') - $(now)))
+  ((left < 0)) && left=0
+  cancel_alarm
+  jset --arg prev "$phase" --argjson left "$left" '.prev=$prev | .phase="paused" | .left=$left'
+  refresh_bar
+  echo "paused with $(fmt_clock "$left") left"
+}
+
+cmd_resume() {
+  local prev left
+  prev=$(sget '.prev // "work"')
+  left=$(sget '.left')
+  ((left <= 0)) && left=$(phase_seconds "$prev")
+  jset --arg p "$prev" --argjson ends "$(($(now) + left))" '.phase=$p | .ends_at=$ends | .left=0'
+  schedule_alarm "$left"
+  refresh_bar
+  echo "resumed, $(fmt_clock "$left") left"
+}
+
+cmd_toggle() {
+  case "$(sget '.phase')" in
+  idle) cmd_start ;;
+  paused) cmd_resume ;;
+  *) cmd_pause ;;
+  esac
+}
+
+cmd_stop() {
+  cancel_alarm
+  jset '.phase="idle" | .ends_at=0 | .left=0'
+  refresh_bar
+  echo "stopped"
+}
+
+cmd_skip() {
+  local phase
+  phase=$(sget '.phase')
+  cancel_alarm
+  case "$phase" in
+  work) finish_work skipped ;;
+  break | long) finish_break ;;
+  *) echo "nothing to skip" ;;
+  esac
+}
+
+log_session() { # phase minutes task_id
+  local phase=$1 mins=$2 id=$3
+  jq -nc --arg phase "$phase" --argjson mins "$mins" --argjson id "${id:-null}" \
+    --arg title "$(task_title "${id:-0}")" --argjson t "$(now)" \
+    --arg date "$(date +%F)" \
+    '{t:$t,date:$date,phase:$phase,minutes:$mins,task:$id,title:$title}' >>"$LOG"
+}
+
+finish_work() { # [skipped]
+  local id cycle next_phase mins
+  id=$(sget '.task')
+  mins=$(((($(now) - $(sget '.started')) + 30) / 60))
+  ((mins < 0)) && mins=0
+  if [[ ${1:-} != skipped ]]; then
+    mins=$((($(sget '.ends_at') - $(sget '.started')) / 60))
+    [[ $id != null ]] && tset --argjson id "$id" 'map(if .id==$id then .done=(.done+1) else . end)'
+  fi
+  log_session work "$mins" "$id"
+  cycle=$(($(sget '.cycle') + 1))
+  jset --argjson c "$cycle" '.cycle=$c'
+  if ((cycle % CYCLES == 0)); then next_phase=long; else next_phase=break; fi
+  local title="" prog=""
+  if [[ $id != null ]]; then
+    title=$(task_title "$id")
+    prog=$(jq -r --argjson id "$id" '(.[]|select(.id==$id)|"\(.done)/\(.est) pomodoros") // ""' "$TASKS")
+  fi
+  local body
+  body=$(printf '%s' "$title")
+  [[ -n $title && -n $prog ]] && body=$(printf '%s\n%s' "$title" "$prog")
+  [[ -z $title ]] && body=$prog
+  if ((AUTO_BREAK)); then
+    notify "󰄬  Focus done — $(phase_label "$next_phase") $((($(phase_seconds "$next_phase")) / 60))m" \
+      "$body" critical "$SOUND_END"
+    begin_phase "$next_phase"
+  else
+    notify "󰄬  Focus done" "$body${body:+ — }start break when ready" critical "$SOUND_END"
+    cmd_stop
+  fi
+}
+
+finish_break() {
+  log_session "$(sget '.phase')" "$((($(sget '.ends_at') - $(sget '.started')) / 60))" "$(sget '.task')"
+  local id title=""
+  id=$(sget '.task')
+  [[ $id != null ]] && title=$(task_title "$id")
+  if ((AUTO_WORK)) && [[ -n $title ]]; then
+    notify "󰔟  Break over — back to it" "$title" critical "$SOUND_END"
+    begin_phase work
+  else
+    notify "󰔟  Break over" "${title:-Pick a task} — Super+Alt+P to start" critical "$SOUND_END"
+    cancel_alarm
+    jset '.phase="idle" | .ends_at=0 | .left=0'
+    refresh_bar
+  fi
+}
+
+cmd_fire() {
+  case "$(sget '.phase')" in
+  work) finish_work ;;
+  break | long) finish_break ;;
+  *) : ;;
+  esac
+}
+
+# --- schedule ---------------------------------------------------------------
+# A timetable of blocks. A systemd timer ticks every 30s and force-starts the
+# right focus session, so the day runs without anyone touching the timer.
+
+SCHED="$CONF_DIR/schedule.conf"
+SCHED_STATE="$DATA/sched.json"
+
+sched_init() {
+  [[ -f $SCHED_STATE ]] || echo '{"date":"","tasks":{},"announced":{}}' >"$SCHED_STATE"
+  [[ -f $SCHED ]] && return 0
+  cat >"$SCHED" <<'SCHEDEOF'
+# pomo timetable. One block per line:
+#
+#   <days>  <start>  <minutes>  <focus>  <title>
+#
+#   days     daily | mon-fri | sat,sun | mon,wed,fri  (mon tue wed thu fri sat sun)
+#   start    HH:MM, 24h
+#   minutes  how long the whole block runs
+#   focus    length of each focus session inside the block
+#   title    what the notification says to do
+#
+# Blank lines and #comments are ignored. Edits apply on the next tick, no
+# restart needed. Check the day with:  pomo sched
+
+daily  11:00  150  50  Build app - practice project, no AI
+daily  14:30  120  50  Open source - land a PR
+daily  17:30  120  50  Reverse engineering - one binary
+daily  20:30   30  25  Write the X post about today's RE
+SCHEDEOF
+  echo "created $SCHED"
+}
+
+sched_dow() { date -d "@${1:-$(now)}" +%a | tr 'A-Z' 'a-z'; }
+
+# Does a days-field like "mon-fri" or "sat,sun" or "daily" cover $2 (e.g. "wed")?
+sched_day_match() {
+  local field=$1 dow=$2 part a b all="mon tue wed thu fri sat sun" i j k
+  [[ $field == daily || $field == all || $field == everyday ]] && return 0
+  field=$(printf '%s' "$field" | tr 'A-Z' 'a-z')
+  local IFS=,
+  for part in $field; do
+    if [[ $part == *-* ]]; then
+      a=${part%%-*}
+      b=${part##*-}
+      i=0 j=-1 k=-1
+      local d n=0
+      for d in $all; do
+        [[ $d == "$a" ]] && j=$n
+        [[ $d == "$b" ]] && k=$n
+        [[ $d == "$dow" ]] && i=$n
+        n=$((n + 1))
+      done
+      ((j < 0 || k < 0)) && continue
+      if ((j <= k)); then
+        ((i >= j && i <= k)) && return 0
+      else # wraps the weekend, e.g. sat-sun or fri-mon
+        ((i >= j || i <= k)) && return 0
+      fi
+    else
+      [[ $part == "$dow" ]] && return 0
+    fi
+  done
+  return 1
+}
+
+# Today's blocks, one per line: key<TAB>start<TAB>end<TAB>focus<TAB>title
+sched_today() {
+  sched_init
+  local dow today_mid days start mins focus title rest
+  dow=$(sched_dow)
+  today_mid=$(date -d "$(date +%F) 00:00" +%s)
+  while read -r days start mins focus rest; do
+    [[ -z ${days:-} || $days == \#* ]] && continue
+    [[ -z ${rest:-} ]] && continue
+    is_num "$mins" && is_num "$focus" || continue
+    [[ $start =~ ^[0-9]{1,2}:[0-9]{2}$ ]] || continue
+    sched_day_match "$days" "$dow" || continue
+    local h=${start%%:*} m=${start##*:} s
+    h=$((10#$h)) m=$((10#$m))
+    s=$((today_mid + h * 3600 + m * 60))
+    title=$rest
+    printf '%s\t%s\t%s\t%s\t%s\n' "$start" "$s" "$((s + mins * 60))" "$focus" "$title"
+  done <"$SCHED" | sort -t"$(printf '\t')" -k2,2n
+}
+
+# Reset the day's bookkeeping when the date rolls over.
+sched_roll() {
+  local today
+  today=$(date +%F)
+  [[ $(jq -r '.date' "$SCHED_STATE") == "$today" ]] && return 0
+  local t
+  t=$(mktemp)
+  jq --arg d "$today" '{date:$d,tasks:{},announced:{}}' "$SCHED_STATE" >"$t" && mv "$t" "$SCHED_STATE"
+}
+
+sched_set() { # jq args, applied to sched.json
+  local t
+  t=$(mktemp)
+  if jq "$@" "$SCHED_STATE" >"$t" 2>/dev/null; then mv "$t" "$SCHED_STATE"; else
+    rm -f "$t"
+    return 1
+  fi
+}
+
+# The task id backing a block today, creating it the first time.
+sched_task() { # key title focus block_minutes
+  local key=$1 title=$2 focus=$3 span=$4 id
+  id=$(jq -r --arg k "$key" '.tasks[$k] // empty' "$SCHED_STATE")
+  if [[ -n $id ]] && task_exists "$id"; then
+    printf '%s' "$id"
+    return 0
+  fi
+  local est=$(((span + focus - 1) / focus))
+  ((est < 1)) && est=1
+  id=$(jq '[.[].id]|max // 0 | .+1' "$TASKS")
+  tset --argjson id "$id" --arg title "$title" --argjson est "$est" \
+    --argjson now "$(now)" --argjson wmin "$focus" \
+    '. + [{id:$id,title:$title,est:$est,done:0,status:"active",created:$now,due:null,wmin:$wmin}]'
+  sched_set --arg k "$key" --arg id "$id" '.tasks[$k]=$id'
+  printf '%s' "$id"
+}
+
+# Export the timetable as an .ics calendar file, so a phone's calendar app can
+# carry the same blocks without ntfy. Times are floating: they land in whatever
+# timezone the importing calendar uses.
+sched_ics() { # [path]
+  sched_init
+  local out=${1:-$DATA/timetable.ics}
+  local days start mins focus rest byday uid dtstart dtend h m eh em total
+  {
+    printf 'BEGIN:VCALENDAR\r\n'
+    printf 'VERSION:2.0\r\n'
+    printf 'PRODID:-//pomo//timetable//EN\r\n'
+    printf 'CALSCALE:GREGORIAN\r\n'
+    while read -r days start mins focus rest; do
+      [[ -z ${days:-} || $days == \#* ]] && continue
+      [[ -z ${rest:-} ]] && continue
+      is_num "$mins" && is_num "$focus" || continue
+      [[ $start =~ ^[0-9]{1,2}:[0-9]{2}$ ]] || continue
+      byday=$(sched_byday "$days") || continue
+      h=$((10#${start%%:*})) m=$((10#${start##*:}))
+      total=$((h * 60 + m + mins))
+      eh=$(((total / 60) % 24)) em=$((total % 60))
+      dtstart=$(printf '%02d%02d00' "$h" "$m")
+      dtend=$(printf '%02d%02d00' "$eh" "$em")
+      uid=$(printf '%s %s %s' "$days" "$start" "$rest" | md5sum | cut -c1-32)
+      printf 'BEGIN:VEVENT\r\n'
+      printf 'UID:%s@pomo\r\n' "$uid"
+      printf 'DTSTAMP:%s\r\n' "$(date -u +%Y%m%dT%H%M%SZ)"
+      printf 'DTSTART:%sT%s\r\n' "$(date +%Y%m%d)" "$dtstart"
+      printf 'DTEND:%sT%s\r\n' "$(date +%Y%m%d)" "$dtend"
+      printf 'RRULE:FREQ=WEEKLY;BYDAY=%s\r\n' "$byday"
+      printf 'SUMMARY:%s\r\n' "$(ics_escape "$rest")"
+      printf 'DESCRIPTION:%s\r\n' "$(ics_escape "pomo block - ${focus}m focus sessions")"
+      printf 'BEGIN:VALARM\r\nTRIGGER:PT0M\r\nACTION:DISPLAY\r\nDESCRIPTION:%s\r\nEND:VALARM\r\n' \
+        "$(ics_escape "$rest")"
+      printf 'BEGIN:VALARM\r\nTRIGGER:-PT5M\r\nACTION:DISPLAY\r\nDESCRIPTION:%s\r\nEND:VALARM\r\n' \
+        "$(ics_escape "Next up: $rest")"
+      printf 'END:VEVENT\r\n'
+    done <"$SCHED"
+    printf 'END:VCALENDAR\r\n'
+  } >"$out"
+  echo "$out"
+}
+
+ics_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/;/\;/g; s/,/\\,/g'; }
+
+# days field -> iCalendar BYDAY list, e.g. "mon-fri" -> MO,TU,WE,TH,FR
+sched_byday() {
+  local field=$1 d out=""
+  for d in mon tue wed thu fri sat sun; do
+    if sched_day_match "$field" "$d"; then
+      case $d in
+      mon) out+=",MO" ;; tue) out+=",TU" ;; wed) out+=",WE" ;; thu) out+=",TH" ;;
+      fri) out+=",FR" ;; sat) out+=",SA" ;; sun) out+=",SU" ;;
+      esac
+    fi
+  done
+  [[ -z $out ]] && return 1
+  printf '%s' "${out#,}"
+}
+
+# Publish the .ics as a secret gist and hand back a URL that Google Calendar
+# (or any calendar app) can subscribe to, so the timetable keeps itself in sync
+# without an OAuth setup. Needs the `gh` CLI, logged in with the `gist` scope.
+sched_gcal() {
+  command -v gh >/dev/null || {
+    echo "needs the gh CLI: https://cli.github.com" >&2
+    return 1
+  }
+  local ics id url state="$DATA/gcal.json"
+  ics=$(sched_ics "$DATA/timetable.ics") || return 1
+  [[ -f $state ]] || echo '{}' >"$state"
+  id=$(jq -r '.gist // empty' "$state")
+  if [[ -n $id ]] && gh gist view "$id" >/dev/null 2>&1; then
+    gh gist edit "$id" -f timetable.ics "$ics" >/dev/null || return 1
+  else
+    url=$(gh gist create --desc "pomo timetable" -f timetable.ics "$ics" 2>/dev/null) || {
+      echo "could not create the gist. Check: gh auth status" >&2
+      return 1
+    }
+    id=${url##*/}
+    jq -n --arg g "$id" '{gist:$g}' >"$state"
+  fi
+  local user
+  user=$(gh api user -q .login 2>/dev/null)
+  url="https://gist.githubusercontent.com/$user/$id/raw/timetable.ics"
+  echo "$url"
+}
+
+# Fires every 30s from pomo-sched.timer.
+cmd_sched_tick() {
+  sched_init
+  sched_roll
+  local n blocks
+  n=$(now)
+  blocks=$(sched_today)
+  [[ -z $blocks ]] && return 0
+
+  # Morning push: the whole day, on the phone, before any of it starts.
+  if [[ -n ${AGENDA_AT:-} && $(jq -r '.announced.agenda // empty' "$SCHED_STATE") != 1 ]]; then
+    local ah=${AGENDA_AT%%:*} am=${AGENDA_AT##*:} amid
+    amid=$(date -d "$(date +%F) 00:00" +%s)
+    amid=$((amid + 10#$ah * 3600 + 10#$am * 60))
+    if ((n >= amid)); then
+      sched_set '.announced.agenda=1'
+      push "󰃭  Today" "$(cmd_sched)" critical
+    fi
+  fi
+
+  local key start end focus title cur_key="" cur_start=0 cur_end=0 cur_focus=0 cur_title=""
+  while IFS=$'\t' read -r key start end focus title; do
+    [[ -z $key ]] && continue
+    if ((n >= start && n < end)); then
+      cur_key=$key cur_start=$start cur_end=$end cur_focus=$focus cur_title=$title
+    elif ((n >= end)); then
+      # Block is over: close its task out so the checklist shows it ticked.
+      local past
+      past=$(jq -r --arg k "$key" '.tasks[$k] // empty' "$SCHED_STATE")
+      if [[ -n $past ]] && task_exists "$past" &&
+        [[ $(jq -r --argjson id "$past" '(.[]|select(.id==$id)|.status)' "$TASKS") == active ]]; then
+        tset --argjson id "$past" 'map(if .id==$id then .status="done" else . end)'
+        if [[ $(sget '.task') == "$past" ]]; then
+          case "$(sget '.phase')" in
+          work | paused) cmd_stop >/dev/null ;;
+          esac
+          jset '.task=null'
+        fi
+        refresh_bar
+      fi
+    fi
+  done <<<"$blocks"
+
+  local phase
+  phase=$(sget '.phase')
+
+  if [[ -z $cur_key ]]; then
+    # Outside every block. Stop a session left running from one that ended.
+    if [[ $phase == work ]]; then
+      local t
+      t=$(sget '.task')
+      if [[ $t != null ]] &&
+        jq -e --argjson id "$t" 'any(.[]; .id==$id and .status=="done")' "$TASKS" >/dev/null 2>&1; then
+        cmd_stop >/dev/null
+      fi
+    fi
+    return 0
+  fi
+
+  local id
+  id=$(sched_task "$cur_key" "$cur_title" "$cur_focus" $(((cur_end - cur_start) / 60)))
+
+  # Announce the block once, the moment it opens.
+  if [[ $(jq -r --arg k "$cur_key" '.announced[$k] // empty' "$SCHED_STATE") != 1 ]]; then
+    sched_set --arg k "$cur_key" '.announced[$k]=1'
+    notify "󰃭  $(date -d "@$cur_start" +%H:%M) — now do this" \
+      "$cur_title
+until $(date -d "@$cur_end" +%H:%M)" critical "$SOUND_DUE"
+  fi
+
+  case "$phase" in
+  break | long) return 0 ;; # a break is earned, let it run
+  work)
+    [[ $(sget '.task') == "$id" ]] && return 0
+    ;;
+  esac
+
+  # Idle, paused, or drifted onto something else: put the block back on.
+  local left=$(((cur_end - n) / 60))
+  local mins=$cur_focus
+  ((left < mins)) && mins=$left
+  ((mins < 1)) && return 0
+  cancel_alarm
+  cmd_start "$id" -m "$mins" >/dev/null
+}
+
+# The checklist: what today looks like and where you are in it.
+cmd_sched() {
+  case "${1:-}" in
+  tick)
+    cmd_sched_tick
+    return $?
+    ;;
+  edit)
+    sched_init
+    "${EDITOR:-nano}" "$SCHED"
+    return $?
+    ;;
+  ics)
+    shift
+    sched_ics "$@"
+    return $?
+    ;;
+  gcal)
+    sched_gcal
+    return $?
+    ;;
+  on)
+    systemctl --user enable --now pomo-sched.timer
+    return $?
+    ;;
+  off)
+    systemctl --user disable --now pomo-sched.timer
+    return $?
+    ;;
+  esac
+  sched_init
+  sched_roll
+  local n blocks
+  n=$(now)
+  blocks=$(sched_today)
+  if [[ -z $blocks ]]; then
+    echo "nothing scheduled today. edit $SCHED"
+    return 0
+  fi
+  local key start end focus title mark id prog
+  while IFS=$'\t' read -r key start end focus title; do
+    [[ -z $key ]] && continue
+    if ((n >= end)); then
+      mark="[x]"
+    elif ((n >= start)); then
+      mark="[>]"
+    else
+      mark="[ ]"
+    fi
+    prog=""
+    id=$(jq -r --arg k "$key" '.tasks[$k] // empty' "$SCHED_STATE")
+    [[ -n $id ]] && task_exists "$id" &&
+      prog=$(jq -r --argjson id "$id" '(.[]|select(.id==$id)|"  (\(.done)/\(.est))") // ""' "$TASKS")
+    printf '%s %s-%s  %s%s\n' "$mark" "$key" "$(date -d "@$end" +%H:%M)" "$title" "$prog"
+  done <<<"$blocks"
+}
+
+cmd_push() { # phone mirroring: pomo push [test|<message>]
+  if [[ -z ${NTFY_TOPIC:-} ]]; then
+    echo "no NTFY_TOPIC set. Add one to $CONF, then subscribe to the same" >&2
+    echo "topic in the ntfy app (Android/iOS/web) to get these on your phone." >&2
+    return 1
+  fi
+  local msg=${*:-}
+  [[ -z $msg || $msg == test ]] && msg="If this landed on your phone, the timetable will too."
+  push "󰄬  pomo test" "$msg" critical
+  sleep 1
+  echo "sent to ${NTFY_SERVER%/}/$NTFY_TOPIC"
+}
+
+# --- reminders --------------------------------------------------------------
+
+cmd_due_check() {
+  local n
+  n=$(now)
+  local due
+  due=$(jq -r --argjson n "$n" '
+    map(select(.status=="active" and .due != null and .due <= $n and (.notified_due // false | not)))
+    | .[] | "\(.id)\t\(.title)"' "$TASKS")
+  [[ -z $due ]] && return 0
+  while IFS=$'\t' read -r id title; do
+    [[ -z $id ]] && continue
+    notify "󰀠  Task due" "$title" critical "$SOUND_DUE"
+    tset --argjson id "$id" 'map(if .id==$id then .notified_due=true else . end)'
+  done <<<"$due"
+}
+
+cmd_nag() {
+  cmd_due_check
+  ((NAG_MIN == 0)) && return 0
+  [[ $(sget '.phase') != idle ]] && return 0
+  local pending top
+  pending=$(jq '[.[]|select(.status=="active")]|length' "$TASKS")
+  ((pending == 0)) && return 0
+  top=$(jq -r 'map(select(.status=="active"))|sort_by(.due // 9999999999, .created)|.[0].title' "$TASKS")
+  notify "󰔟  Timer idle" "$pending task(s) waiting. Next: $top" normal "$SOUND_START"
+}
+
+cmd_daily() {
+  local done_today mins tasks_done
+  done_today=$(grep -c "\"date\":\"$(date +%F)\",\"phase\":\"work\"" "$LOG" 2>/dev/null || echo 0)
+  mins=$(jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")|.minutes]|add // 0' "$LOG")
+  tasks_done=$(jq '[.[]|select(.status=="done")]|length' "$TASKS")
+  local left
+  left=$(jq '[.[]|select(.status=="active")]|length' "$TASKS")
+  notify "󰃰  Today: $done_today pomodoros, ${mins}m focus" "$tasks_done done all-time · $left still open" normal
+}
+
+cmd_report() {
+  echo "today: $(jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")]|length' "$LOG") pomodoros, $(jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")|.minutes]|add // 0' "$LOG") min focus"
+  echo
+  echo "per task today:"
+  jq -rs --arg d "$(date +%F)" '
+    [.[]|select(.date==$d and .phase=="work" and .title!="")]
+    | group_by(.title)[]
+    | "  \(length)x  \(.[0].title)"' "$LOG"
+  echo
+  echo "last 7 days:"
+  jq -rs --argjson since "$(date -d '7 days ago' +%s)" '
+    [.[]|select(.t>=$since and .phase=="work")]
+    | group_by(.date)[]
+    | "  \(.[0].date)  \(length) pomodoros  \([.[].minutes]|add)m"' "$LOG"
+}
+
+# --- waybar -----------------------------------------------------------------
+
+cmd_waybar() {
+  local phase task left ends started title pending next_title text class tooltip prog
+  IFS=$'\t' read -r phase task ends left < <(jq -r '[.phase,(.task|tostring),(.ends_at|tostring),(.left|tostring)]|@tsv' "$STATE")
+  IFS=$'\t' read -r pending title next_title prog < <(jq -r --argjson id "${task:-null}" '
+    [ ([.[]|select(.status=="active")]|length|tostring),
+      ((.[]|select(.id==$id)|.title) // ""),
+      ((map(select(.status=="active"))|sort_by(.due // 9999999999,.created)|.[0].title) // ""),
+      ((.[]|select(.id==$id)|"\(.done)/\(.est)") // "")
+    ]|@tsv' "$TASKS")
+
+  case "$phase" in
+  idle)
+    class=idle
+    if ((pending > 0)); then
+      text="󰔛 $pending"
+      tooltip="Idle · $pending task(s) pending"$'\n'"Next: ${title:-$next_title}"$'\n\n'"Click: start · Right-click: menu"
+    else
+      text="󰔛"
+      tooltip="No tasks"$'\n\n'"Right-click: menu"
+    fi
+    ;;
+  paused)
+    class=paused
+    text="󰏤 $(fmt_clock "$left")"
+    tooltip="Paused · ${title:-no task} ${prog:+($prog)}"$'\n\n'"Click: resume · Right-click: menu"
+    ;;
+  *)
+    left=$((ends - $(now)))
+    ((left < 0)) && left=0
+    case "$phase" in
+    work)
+      class=work
+      text="󰔟 $(fmt_clock "$left")"
+      ;;
+    break)
+      class=break
+      text="󰅶 $(fmt_clock "$left")"
+      ;;
+    long)
+      class=long
+      text="󰅶 $(fmt_clock "$left")"
+      ;;
+    esac
+    tooltip="$(phase_label "$phase") · ${title:-no task} ${prog:+($prog)}"$'\n\n'"Click: pause · Right-click: menu"
+    ;;
+  esac
+  jq -nc --arg text "$text" --arg class "$class" --arg tooltip "$tooltip" \
+    '{text:$text,class:$class,tooltip:$tooltip}'
+}
+
+cmd_status() {
+  local phase
+  phase=$(sget '.phase')
+  case "$phase" in
+  idle) echo "idle" ;;
+  paused) echo "paused $(fmt_clock "$(sget '.left')") — $(task_title "$(sget '.task')")" ;;
+  *) echo "$(phase_label "$phase") $(fmt_clock $(($(sget '.ends_at') - $(now)))) — $(task_title "$(sget '.task')")" ;;
+  esac
+}
+
+# --- walker UI --------------------------------------------------------------
+
+walker_pick_task() {
+  local list
+  list=$(jq -r 'map(select(.status=="active"))|sort_by(.due // 9999999999,.created)|.[]|"#\(.id)  \(.title)  (\(.done)/\(.est))"' "$TASKS")
+  [[ -z $list ]] && {
+    notify "󰔟  No tasks" "Add one with Super+Alt+T" low
+    return 1
+  }
+  printf '%s\n' "$list" | walker -d -p "${1:-Task}" -e 2>/dev/null | grep -oP '(?<=^#)\d+'
+}
+
+cmd_ui_add() {
+  local input title est due
+  local mins
+  input=$(walker -d -I -p "New task  (title | est | due | minutes)" -e 2>/dev/null)
+  [[ -z $input ]] && return 0
+  IFS='|' read -r title est due mins <<<"$input"
+  title=$(echo "$title" | sed 's/^ *//;s/ *$//')
+  est=$(echo "${est:-1}" | tr -dc '0-9')
+  due=$(echo "${due:-}" | sed 's/^ *//;s/ *$//')
+  [[ -z $title ]] && return 0
+  mins=$(echo "${mins:-}" | tr -dc '0-9')
+  local args=("$title" -e "${est:-1}")
+  [[ -n $due ]] && args+=(-d "$due")
+  [[ -n $mins ]] && args+=(-m "$mins")
+  cmd_add "${args[@]}" >/dev/null && notify "󰐕  Task added" "$title${mins:+ · ${mins}m blocks}" low
+}
+
+cmd_ui_custom() { # one-off focus session of a chosen length (type any number)
+  local mins
+  mins=$(printf '%s\n' "15" "25" "30" "45" "50" "60" "90" |
+    walker -d -I -p "Focus minutes  (pick or type)" -e 2>/dev/null | tr -dc '0-9')
+  [[ -z $mins ]] && return 0
+  ((mins < 1 || mins > 600)) && {
+    notify "󰀦  Bad length" "Enter 1-600 minutes" normal
+    return 1
+  }
+  cmd_start -m "$mins" >/dev/null
+}
+
+cmd_ui_break() { # one-off break of a chosen length (type any number)
+  local mins
+  mins=$(printf '%s\n' "5" "10" "15" "20" "30" |
+    walker -d -I -p "Break minutes  (pick or type)" -e 2>/dev/null | tr -dc '0-9')
+  [[ -z $mins ]] && return 0
+  ((mins < 1 || mins > 600)) && {
+    notify "󰀦  Bad length" "Enter 1-600 minutes" normal
+    return 1
+  }
+  cmd_break -m "$mins" >/dev/null
+}
+
+cmd_ui_pick() {
+  local id
+  id=$(walker_pick_task "Focus on") || return 0
+  [[ -z $id ]] && return 0
+  cmd_use "$id" >/dev/null
+  cmd_start "$id" >/dev/null
+}
+
+cmd_ui_done() {
+  local id
+  id=$(walker_pick_task "Mark done") || return 0
+  [[ -z $id ]] && return 0
+  cmd_done "$id" >/dev/null
+}
+
+cmd_show() { # task list as a notification
+  local body
+  body=$(cmd_ls | sed 's/^/ /')
+  notify "󰄲  Tasks" "$body" normal
+}
+
+cmd_ui_new() { # name + length in one flow, then start it
+  local name mins id
+  name=$(walker -d -I -p "Timer name" -e 2>/dev/null)
+  name=$(echo "$name" | sed 's/^ *//;s/ *$//')
+  [[ -z $name ]] && return 0
+  mins=$(printf '%s\n' "$WORK_MIN" "15" "30" "45" "50" "60" "90" |
+    walker -d -I -p "Minutes  (enter for ${WORK_MIN}, or type)" -e 2>/dev/null | tr -dc '0-9')
+  mins=${mins:-$WORK_MIN}
+  ((mins < 1 || mins > 600)) && {
+    notify "6  Bad length" "Enter 1-600 minutes" normal
+    return 1
+  }
+  id=$(cmd_add "$name" -m "$mins" | grep -oE '#[0-9]+' | tr -dc '0-9')
+  [[ -z $id ]] && return 1
+  cmd_use "$id" >/dev/null
+  cmd_start "$id" >/dev/null
+}
+
+cmd_menu() {
+  local phase choice
+  phase=$(sget '.phase')
+  local toggle_label
+  case "$phase" in
+  idle) toggle_label="5  Resume last" ;;
+  paused) toggle_label="5  Resume" ;;
+  *) toggle_label="4  Pause" ;;
+  esac
+  choice=$(printf '%s\n' \
+    "4  New timer" \
+    "$toggle_label" \
+    "b  Stop timer" \
+    "a  History" |
+    walker -d -p "Pomodoro" -e 2>/dev/null)
+  case "$choice" in
+  *"New timer") cmd_ui_new ;;
+  *Resume* | *Pause) cmd_toggle >/dev/null ;;
+  *Stop*) cmd_stop >/dev/null ;;
+  *History*) notify "a  Pomodoro history" "$(cmd_report | head -14)" normal ;;
+  esac
+}
+
+usage() {
+  cat <<'USAGE'
+pomo — pomodoro timer with task tracking
+
+tasks
+  pomo add <title> [-e N] [-d "time"] [-m MIN]
+                                        add task (N = estimated pomodoros, due parsed by `date -d`,
+                                        MIN = focus length for this task)
+  pomo len <id> <MIN|default>           change a task's focus length
+  pomo ls [-a]                          list tasks (-a includes done)
+  pomo show                             pop the task list as a notification
+  pomo use <id>                         set current task
+  pomo done [id]                        mark done (default: current)
+  pomo rm <id>                          delete a task (aliases: del, delete, remove)
+
+timer
+  pomo start [id] [-m MIN]   start a focus session (MIN overrides the default length)
+  pomo break [-m MIN]        start a break now
+  pomo pause | resume | toggle | stop | skip
+  pomo status          one-line status
+  pomo report          today + last 7 days
+
+ui (walker)
+  pomo menu            New timer / pause / stop / history
+  pomo ui-new          prompt name + minutes, then start
+  pomo ui-add | ui-pick | ui-done | ui-custom | ui-break
+                       older prompts (still work, not in menu)
+
+integration
+  pomo waybar          JSON for a waybar custom module
+  pomo nag             idle nudge + due-task check (systemd timer)
+  pomo daily           end-of-day summary (systemd timer)
+
+config: ~/.config/pomo/config.env
+data:   ~/.local/share/pomo/
+USAGE
+}
+
+cmd=${1:-status}
+shift 2>/dev/null || true
+case "$cmd" in
+add) cmd_add "$@" ;;
+ls | list) cmd_ls "$@" ;;
+use) cmd_use "$@" ;;
+done) cmd_done "$@" ;;
+rm | del | delete | remove) cmd_rm "$@" ;;
+start) cmd_start "$@" ;;
+break) cmd_break "$@" ;;
+len) cmd_len "$@" ;;
+pause) cmd_pause ;;
+resume) cmd_resume ;;
+toggle) cmd_toggle ;;
+stop) cmd_stop ;;
+skip) cmd_skip ;;
+status) cmd_status ;;
+report) cmd_report ;;
+waybar) cmd_waybar ;;
+nag) cmd_nag ;;
+sched) cmd_sched "$@" ;;
+push) cmd_push "$@" ;;
+daily) cmd_daily ;;
+menu) cmd_menu ;;
+ui-add) cmd_ui_add ;;
+ui-new) cmd_ui_new ;;
+ui-pick) cmd_ui_pick ;;
+ui-done) cmd_ui_done ;;
+ui-custom) cmd_ui_custom ;;
+ui-break) cmd_ui_break ;;
+show) cmd_show ;;
+_fire) cmd_fire ;;
+help | -h | --help) usage ;;
+*)
+  echo "unknown command: $cmd" >&2
+  usage
+  exit 1
+  ;;
+esac

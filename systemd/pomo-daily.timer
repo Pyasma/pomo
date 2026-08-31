@@ -1,0 +1,10 @@
+[Unit]
+Description=Pomodoro daily summary at 18:30
+
+[Timer]
+OnCalendar=*-*-* 18:30:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
