@@ -100,6 +100,8 @@ how long the whole block runs; `focus` is one session inside it.
 
 What a tick does:
 
+- `PREP_MIN` minutes before a block (10 by default), a heads-up notification
+  names what is coming and when. `PREP_MIN=0` turns it off.
 - At a block's start, a critical notification says what to do, and a task is
   created for it (title = the block title, `est` = sessions that fit).
 - If the timer is idle, paused, or on some other task while a block is open, it
@@ -142,8 +144,8 @@ show the day without ntfy.
   editing `schedule.conf`; the gist keeps the same URL, and Google re-reads it
   on its own schedule (hours, not seconds).
 
-Events are weekly-recurring with two alarms: one at the start, one 5 minutes
-before. Times are floating, so they follow whatever timezone the calendar uses.
+Events are weekly-recurring with two alarms: one at the start, one `PREP_MIN`
+minutes before. Times are floating, so they follow whatever timezone the calendar uses.
 
 ## Reminders
 

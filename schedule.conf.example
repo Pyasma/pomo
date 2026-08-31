@@ -11,6 +11,8 @@
 # Blank lines and #comments are ignored. Edits apply on the next tick, no
 # restart needed. Check the day with:  pomo sched
 
+daily  08:00  120  50  DSA practice - patterns, not volume
+daily  10:15   30  30  Apply to roles + follow up on outreach
 daily  11:00  150  50  Build app - practice project, no AI
 daily  14:30  120  50  Open source - land a PR
 daily  17:30  120  50  Reverse engineering - one binary

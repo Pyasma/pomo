@@ -28,6 +28,7 @@ NAG_MIN=30
 NTFY_SERVER=https://ntfy.sh
 NTFY_TOPIC=
 PUSH_ALL=0
+PREP_MIN=10
 AGENDA_AT=08:00
 SOUND_END=/usr/share/sounds/freedesktop/stereo/complete.oga
 SOUND_START=/usr/share/sounds/freedesktop/stereo/message.oga
@@ -50,6 +51,7 @@ NAG_MIN=30        # minutes between idle nudges (0 disables)
 NTFY_SERVER=https://ntfy.sh
 NTFY_TOPIC=       # ntfy topic to mirror alerts to your phone (empty = off)
 PUSH_ALL=0        # 1 = push every notification, not just the urgent ones
+PREP_MIN=10       # heads-up notification this many minutes before a block
 AGENDA_AT=08:00   # time of the "here is today" push (empty disables)
 SOUND_END=/usr/share/sounds/freedesktop/stereo/complete.oga
 SOUND_START=/usr/share/sounds/freedesktop/stereo/message.oga
@@ -686,7 +688,7 @@ sched_ics() { # [path]
       printf 'DESCRIPTION:%s\r\n' "$(ics_escape "pomo block - ${focus}m focus sessions")"
       printf 'BEGIN:VALARM\r\nTRIGGER:PT0M\r\nACTION:DISPLAY\r\nDESCRIPTION:%s\r\nEND:VALARM\r\n' \
         "$(ics_escape "$rest")"
-      printf 'BEGIN:VALARM\r\nTRIGGER:-PT5M\r\nACTION:DISPLAY\r\nDESCRIPTION:%s\r\nEND:VALARM\r\n' \
+      printf 'BEGIN:VALARM\r\nTRIGGER:-PT%dM\r\nACTION:DISPLAY\r\nDESCRIPTION:%s\r\nEND:VALARM\r\n' "${PREP_MIN:-10}" \
         "$(ics_escape "Next up: $rest")"
       printf 'END:VEVENT\r\n'
     done <"$SCHED"
@@ -765,7 +767,16 @@ cmd_sched_tick() {
     [[ -z $key ]] && continue
     if ((n >= start && n < end)); then
       cur_key=$key cur_start=$start cur_end=$end cur_focus=$focus cur_title=$title
-    elif ((n >= end)); then
+    elif ((n < start)); then
+      # Heads-up a few minutes early, so a block opening is never a surprise.
+      if ((${PREP_MIN:-0} > 0 && start - n <= ${PREP_MIN:-0} * 60)) &&
+        [[ $(jq -r --arg k "pre:$key" '.announced[$k] // empty' "$SCHED_STATE") != 1 ]]; then
+        sched_set --arg k "pre:$key" '.announced[$k]=1'
+        notify "󰀠  In $(((start - n + 59) / 60)) min — get ready" \
+          "$title
+starts $(date -d "@$start" +%H:%M)" critical "$SOUND_DUE"
+      fi
+    else
       # Block is over: close its task out so the checklist shows it ticked.
       local past
       past=$(jq -r --arg k "$key" '.tasks[$k] // empty' "$SCHED_STATE")

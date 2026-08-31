@@ -16,6 +16,8 @@ module, optional Hyprland keybinds, optional push to your phone.
 
 ```
 # <days>  <start>  <minutes>  <focus>  <title>
+daily  08:00  120  50  DSA practice - patterns, not volume
+daily  10:15   30  30  Apply to roles + follow up on outreach
 daily  11:00  150  50  Build app - practice project, no AI
 daily  14:30  120  50  Open source - land a PR
 daily  17:30  120  50  Reverse engineering - one binary
@@ -28,6 +30,8 @@ daily  20:30   30  25  Write the X post about today's RE
 
 `pomo-sched.timer` ticks every 30 seconds and:
 
+- warns you `PREP_MIN` minutes before a block (10 by default), so it never
+  arrives cold
 - announces a block the moment it opens, and creates a task for it
 - starts the focus session — nothing to press
 - puts you back on the block's task if the timer is idle, paused, or on
