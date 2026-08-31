@@ -13,7 +13,13 @@
 
 # 165 = three 45m sessions with a 15m rest between them.
 # 105 = two of them.  Rests come from BREAK_MIN in config.env.
-daily  09:00  165  45  Build app - practice project, no AI
-daily  12:30  165  45  Open source - land a PR
-daily  16:00  165  45  Reverse engineering - one binary
-daily  19:30   45  45  Write and post the X thread about today's RE
+
+# --- morning ---
+daily  10:00  165  45  Morning - build the app, practice project, no AI
+
+# --- evening ---
+daily  16:00  165  45  Evening - open source, land a PR
+
+# --- night ---
+daily  20:00  165  45  Night - reverse engineering, one binary
+daily  23:00   45  45  Night - write and post the X thread about today's RE

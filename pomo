@@ -104,9 +104,12 @@ push() { # title body [urgency]
   critical) prio=high ;;
   low) prio=low ;;
   esac
-  (curl -fsS -m 8 -X POST \
+  # Synchronous on purpose. Backgrounding it loses the push: the tick runs as a
+  # oneshot systemd service, and systemd tears down the whole cgroup the moment
+  # the main process exits, taking a detached curl with it.
+  curl -fsS -m 5 -X POST \
     -H "Title: $1" -H "Priority: $prio" -H "Tags: tomato" \
-    -d "${2:-}" "${NTFY_SERVER%/}/$NTFY_TOPIC" >/dev/null 2>&1 &) 2>/dev/null
+    -d "${2:-}" "${NTFY_SERVER%/}/$NTFY_TOPIC" >/dev/null 2>&1
   true
 }
 
