@@ -664,11 +664,24 @@ sched_ics() { # [path]
   sched_init
   local out=${1:-$DATA/timetable.ics}
   local days start mins focus rest byday uid dtstart dtend h m eh em total
+  # Name the timezone explicitly. Without a TZID, calendars are free to read a
+  # bare local time as UTC, which slides the whole day by the local offset.
+  local tz off
+  tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+  [[ -z $tz ]] && tz=$(readlink -f /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')
+  [[ -z $tz ]] && tz=UTC
+  off=$(date +%z)
   {
     printf 'BEGIN:VCALENDAR\r\n'
     printf 'VERSION:2.0\r\n'
     printf 'PRODID:-//pomo//timetable//EN\r\n'
     printf 'CALSCALE:GREGORIAN\r\n'
+    # A minimal fallback definition; clients that know the IANA name use their
+    # own rules instead, which is what we want.
+    printf 'BEGIN:VTIMEZONE\r\nTZID:%s\r\n' "$tz"
+    printf 'BEGIN:STANDARD\r\nDTSTART:19700101T000000\r\n'
+    printf 'TZOFFSETFROM:%s\r\nTZOFFSETTO:%s\r\nTZNAME:%s\r\n' "$off" "$off" "$tz"
+    printf 'END:STANDARD\r\nEND:VTIMEZONE\r\n'
     while read -r days start mins focus rest; do
       [[ -z ${days:-} || $days == \#* ]] && continue
       [[ -z ${rest:-} ]] && continue
@@ -684,8 +697,8 @@ sched_ics() { # [path]
       printf 'BEGIN:VEVENT\r\n'
       printf 'UID:%s@pomo\r\n' "$uid"
       printf 'DTSTAMP:%s\r\n' "$(date -u +%Y%m%dT%H%M%SZ)"
-      printf 'DTSTART:%sT%s\r\n' "$(date +%Y%m%d)" "$dtstart"
-      printf 'DTEND:%sT%s\r\n' "$(date +%Y%m%d)" "$dtend"
+      printf 'DTSTART;TZID=%s:%sT%s\r\n' "$tz" "$(date +%Y%m%d)" "$dtstart"
+      printf 'DTEND;TZID=%s:%sT%s\r\n' "$tz" "$(date +%Y%m%d)" "$dtend"
       printf 'RRULE:FREQ=WEEKLY;BYDAY=%s\r\n' "$byday"
       printf 'SUMMARY:%s\r\n' "$(ics_escape "$rest")"
       printf 'DESCRIPTION:%s\r\n' "$(ics_escape "pomo block - ${focus}m focus sessions")"
