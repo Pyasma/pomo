@@ -16,12 +16,10 @@ module, optional Hyprland keybinds, optional push to your phone.
 
 ```
 # <days>  <start>  <minutes>  <focus>  <title>
-daily  08:00  120  50  DSA practice - patterns, not volume
-daily  10:15   30  30  Apply to roles + follow up on outreach
-daily  11:00  150  50  Build app - practice project, no AI
-daily  14:30  120  50  Open source - land a PR
-daily  17:30  120  50  Reverse engineering - one binary
-daily  20:30   30  25  Write the X post about today's RE
+daily  09:00  150  50  Build app - practice project, no AI
+daily  12:30  120  50  Open source - land a PR
+daily  15:30  150  50  Reverse engineering - one binary
+daily  20:00   30  25  Write the X post about today's RE
 ```
 
 - `days` — `daily`, a range (`mon-fri`), or a list (`mon,wed,fri`)
