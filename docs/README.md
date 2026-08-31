@@ -52,7 +52,7 @@ pomo break [-m MIN]                           # start a break of your own length
 pomo len <id> <MIN|default>                   # change a task's focus length
 pomo done [id] | rm <id> | use <id>
 pomo status | report
-pomo sched [edit|on|off]                     # timetable / today's checklist
+pomo sched [edit|on|off|ics|gcal]             # timetable / today's checklist
 pomo push [test]                              # phone push over ntfy
 ```
 
@@ -129,6 +129,21 @@ keep it long and random and do not share it.
 - `AGENDA_AT=08:00` pushes the whole day's checklist each morning (empty to
   disable).
 - `pomo push test` sends a test message.
+
+## Calendar
+
+The timetable also exports as an iCalendar file, so a phone's calendar app can
+show the day without ntfy.
+
+- `pomo sched ics [path]` — write the `.ics` (default
+  `~/.local/share/pomo/timetable.ics`) and import it by hand.
+- `pomo sched gcal` — upload that file to a secret gist and print a URL. Add it
+  in Google Calendar under *Other calendars → From URL*. Re-run it after
+  editing `schedule.conf`; the gist keeps the same URL, and Google re-reads it
+  on its own schedule (hours, not seconds).
+
+Events are weekly-recurring with two alarms: one at the start, one 5 minutes
+before. Times are floating, so they follow whatever timezone the calendar uses.
 
 ## Reminders
 
