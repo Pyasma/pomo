@@ -149,7 +149,8 @@ show the day without ntfy.
   on its own schedule (hours, not seconds).
 
 Events are weekly-recurring with two alarms: one at the start, one `PREP_MIN`
-minutes before. Times are floating, so they follow whatever timezone the calendar uses.
+minutes before. Each one carries the machine's own timezone as a `TZID`, so the
+blocks land at the hour you wrote no matter where the calendar is read.
 
 ## Reminders
 
