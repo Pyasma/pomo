@@ -10,25 +10,6 @@ and puts you back on it when you drift.
 Built for Linux — notifications through `notify-send`, an optional waybar
 module, optional Hyprland keybinds, optional push to your phone.
 
-## The timetable
-
-`~/.config/pomo/schedule.conf`:
-
-```
-# <days>  <start>  <minutes>  <focus>  <title>
-daily  09:00  165  45  Build app - practice project, no AI
-daily  12:30  165  45  Open source - land a PR
-daily  16:00  165  45  Reverse engineering - one binary
-daily  19:30   45  45  Write and post the X thread about today's RE
-```
-
-- `days` — `daily`, a range (`mon-fri`), or a list (`mon,wed,fri`)
-- `minutes` — how long the whole block runs, rests included. Three 45-minute
-  sessions with a 15-minute rest between them is `165`; two is `105`.
-- `focus` — one focus session inside it. Rests come from `BREAK_MIN`.
-
-`pomo-sched.timer` ticks every 30 seconds and:
-
 - warns you `PREP_MIN` minutes before a block (10 by default), so it never
   arrives cold
 - announces a block the moment it opens, and creates a task for it
