@@ -16,19 +16,16 @@ module, optional Hyprland keybinds, optional push to your phone.
 
 ```
 # <days>  <start>  <minutes>  <focus>  <title>
-daily  09:00   75  35  Build app - practice project, no AI
-daily  10:30   60  30  Open source - land a PR
-daily  12:30   75  35  Reverse engineering - one binary
-daily  15:00   75  35  Build app - second pass
-daily  16:30   60  30  Open source - review and follow up on the PR
-daily  17:45   75  35  Reverse engineering - second binary
-daily  19:30   15  15  Draft the X post about today's RE
-daily  20:30   15  15  Post it and reply to comments
+daily  09:00  165  45  Build app - practice project, no AI
+daily  12:30  165  45  Open source - land a PR
+daily  16:00  165  45  Reverse engineering - one binary
+daily  19:30   45  45  Write and post the X thread about today's RE
 ```
 
 - `days` — `daily`, a range (`mon-fri`), or a list (`mon,wed,fri`)
-- `minutes` — how long the whole block runs
-- `focus` — one focus session inside it
+- `minutes` — how long the whole block runs, rests included. Three 45-minute
+  sessions with a 15-minute rest between them is `165`; two is `105`.
+- `focus` — one focus session inside it. Rests come from `BREAK_MIN`.
 
 `pomo-sched.timer` ticks every 30 seconds and:
 
@@ -38,7 +35,8 @@ daily  20:30   15  15  Post it and reply to comments
 - starts the focus session — nothing to press
 - puts you back on the block's task if the timer is idle, paused, or on
   something else (breaks are left alone)
-- shortens the last session so it never runs past the block's end
+- runs every session at its full length: if less than `focus` minutes are left
+  in the block, it starts nothing rather than a stub
 - marks the task done and stops the timer when the block's window closes
 
 ```

@@ -89,11 +89,14 @@ the timer starts itself — nothing to press.
 
 ```
 # <days>  <start>  <minutes>  <focus>  <title>
-daily  11:00  150  50  Build app - practice project, no AI
-daily  14:30  120  50  Open source - land a PR
-daily  17:30  120  50  Reverse engineering - one binary
-daily  20:30   30  25  Write the X post about today's RE
+daily  09:00  165  45  Build app - practice project, no AI
+daily  12:30  165  45  Open source - land a PR
+daily  16:00  165  45  Reverse engineering - one binary
+daily  19:30   45  45  Write and post the X thread about today's RE
 ```
+
+`minutes` covers the rests too: three 45-minute sessions with a 15-minute rest
+between them is `165`. Rest length is `BREAK_MIN` in `config.env`.
 
 `days` is `daily`, a range (`mon-fri`), or a list (`mon,wed,fri`). `minutes` is
 how long the whole block runs; `focus` is one session inside it.
@@ -106,7 +109,8 @@ What a tick does:
   created for it (title = the block title, `est` = sessions that fit).
 - If the timer is idle, paused, or on some other task while a block is open, it
   is put back on the block's task. Breaks are left alone.
-- The last session of a block is shortened so it does not run past the end.
+- A session runs its full length or not at all: with less than `focus` minutes
+  left in the block, nothing new starts.
 - When a block's window closes, its task is marked done and any session still
   running is stopped.
 

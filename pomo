@@ -829,12 +829,12 @@ until $(date -d "@$cur_end" +%H:%M)" critical "$SOUND_DUE"
   esac
 
   # Idle, paused, or drifted onto something else: put the block back on.
+  # A session runs its full length or not at all — a truncated stub is worse
+  # than ending the block a few minutes early.
   local left=$(((cur_end - n) / 60))
-  local mins=$cur_focus
-  ((left < mins)) && mins=$left
-  ((mins < 1)) && return 0
+  ((left < cur_focus)) && return 0
   cancel_alarm
-  cmd_start "$id" -m "$mins" >/dev/null
+  cmd_start "$id" -m "$cur_focus" >/dev/null
 }
 
 # The checklist: what today looks like and where you are in it.
