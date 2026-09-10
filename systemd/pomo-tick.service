@@ -1,0 +1,6 @@
+[Unit]
+Description=pomo day tick
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/pomo tick

@@ -28,7 +28,6 @@ NAG_MIN=30
 NTFY_SERVER=https://ntfy.sh
 NTFY_TOPIC=
 PUSH_ALL=0
-PREP_MIN=10
 AGENDA_AT=08:00
 SOUND_END=/usr/share/sounds/freedesktop/stereo/complete.oga
 SOUND_START=/usr/share/sounds/freedesktop/stereo/message.oga
@@ -51,7 +50,6 @@ NAG_MIN=30        # minutes between idle nudges (0 disables)
 NTFY_SERVER=https://ntfy.sh
 NTFY_TOPIC=       # ntfy topic to mirror alerts to your phone (empty = off)
 PUSH_ALL=0        # 1 = push every notification, not just the urgent ones
-PREP_MIN=10       # heads-up notification this many minutes before a block
 AGENDA_AT=08:00   # time of the "here is today" push (empty disables)
 SOUND_END=/usr/share/sounds/freedesktop/stereo/complete.oga
 SOUND_START=/usr/share/sounds/freedesktop/stereo/message.oga
@@ -63,8 +61,10 @@ fi
 now() { date +%s; }
 
 jset() {
+  # The temp file has to sit next to the target: with TMPDIR on another
+  # filesystem, mv falls back to copy+unlink and readers see it missing.
   local t
-  t=$(mktemp)
+  t=$(mktemp "$STATE.XXXXXX")
   if jq "$@" "$STATE" >"$t" 2>/dev/null; then
     mv "$t" "$STATE"
   else
@@ -74,8 +74,10 @@ jset() {
   fi
 }
 tset() {
+  # The temp file has to sit next to the target: with TMPDIR on another
+  # filesystem, mv falls back to copy+unlink and readers see it missing.
   local t
-  t=$(mktemp)
+  t=$(mktemp "$TASKS.XXXXXX")
   if jq "$@" "$TASKS" >"$t" 2>/dev/null; then
     mv "$t" "$TASKS"
   else
@@ -306,9 +308,9 @@ cmd_done() {
   title=$(task_title "$id")
   tset --argjson id "$id" 'map(if .id==$id then .status="done" else . end)'
   [[ $(sget '.task') == "$id" ]] && jset '.task=null'
-  notify "󰄬  Task done" "$title" low
   echo "done #$id  $title"
   refresh_bar
+  sess_after_done "$id"
 }
 
 cmd_rm() {
@@ -366,9 +368,13 @@ begin_phase() { # phase [task_id] [seconds]
 }
 
 cmd_start() {
-  local id="" mins=""
+  local id="" mins="" quiet=0
   while (($#)); do
     case "$1" in
+    -q | --quiet)
+      quiet=1
+      shift
+      ;;
     -m | --minutes)
       mins=$2
       shift 2
@@ -399,7 +405,7 @@ cmd_start() {
   fi
   [[ -z $mins || $mins == null ]] && mins=$WORK_MIN
   begin_phase work "$id" $((mins * 60))
-  notify "󰔟  Focus ${mins}m" "$(task_title "$id")" low "$SOUND_START"
+  ((quiet)) || notify "󰔟  Focus ${mins}m" "$(task_title "$id")" low "$SOUND_START"
   echo "focus ${mins}m on #$id $(task_title "$id")"
 }
 
@@ -447,7 +453,7 @@ cmd_resume() {
 
 cmd_toggle() {
   case "$(sget '.phase')" in
-  idle) cmd_start ;;
+  idle) cmd_sess_start ;;
   paused) cmd_resume ;;
   *) cmd_pause ;;
   esac
@@ -492,6 +498,9 @@ finish_work() { # [skipped]
   cycle=$(($(sget '.cycle') + 1))
   jset --argjson c "$cycle" '.cycle=$c'
   if ((cycle % CYCLES == 0)); then next_phase=long; else next_phase=break; fi
+  local sn sprog=""
+  sn=$(sess_of_task "${id:-null}")
+  [[ -n $sn ]] && sprog="S$sn · $(sess_focus_done "$sn")/$(sess_est "$sn") focus"
   local title="" prog=""
   if [[ $id != null ]]; then
     title=$(task_title "$id")
@@ -502,25 +511,27 @@ finish_work() { # [skipped]
   [[ -n $title && -n $prog ]] && body=$(printf '%s\n%s' "$title" "$prog")
   [[ -z $title ]] && body=$prog
   if ((AUTO_BREAK)); then
-    notify "󰄬  Focus done — $(phase_label "$next_phase") $((($(phase_seconds "$next_phase")) / 60))m" \
+    notify "󰄬  ${sprog:-Focus done} — $(phase_label "$next_phase") $((($(phase_seconds "$next_phase")) / 60))m" \
       "$body" critical "$SOUND_END"
     begin_phase "$next_phase"
   else
-    notify "󰄬  Focus done" "$body${body:+ — }start break when ready" critical "$SOUND_END"
+    notify "󰄬  ${sprog:-Focus done}" "$body${body:+ — }start break when ready" critical "$SOUND_END"
     cmd_stop
   fi
 }
 
 finish_break() {
   log_session "$(sget '.phase')" "$((($(sget '.ends_at') - $(sget '.started')) / 60))" "$(sget '.task')"
-  local id title=""
+  local id title="" sn tag="Break over"
   id=$(sget '.task')
   [[ $id != null ]] && title=$(task_title "$id")
+  sn=$(sess_of_task "${id:-null}")
+  [[ -n $sn ]] && tag="S$sn · break over"
   if ((AUTO_WORK)) && [[ -n $title ]]; then
-    notify "󰔟  Break over — back to it" "$title" critical "$SOUND_END"
+    notify "󰔟  ${tag} — back to it" "$title" critical "$SOUND_END"
     begin_phase work
   else
-    notify "󰔟  Break over" "${title:-Pick a task} — Super+Alt+P to start" critical "$SOUND_END"
+    notify "󰔟  ${tag}" "${title:-Pick a task} — Super+Alt+P to start" critical "$SOUND_END"
     cancel_alarm
     jset '.phase="idle" | .ends_at=0 | .left=0'
     refresh_bar
@@ -535,381 +546,491 @@ cmd_fire() {
   esac
 }
 
-# --- schedule ---------------------------------------------------------------
-# A timetable of blocks. A systemd timer ticks every 30s and force-starts the
-# right focus session, so the day runs without anyone touching the timer.
+# --- sessions ---------------------------------------------------------------
+# Three sessions a day, started whenever you like. A session ends when every
+# task inside it is ticked, not when a clock says so. The timetable only fixes
+# how much work a session is worth, never when it has to happen.
 
-SCHED="$CONF_DIR/schedule.conf"
-SCHED_STATE="$DATA/sched.json"
+SESSIONS="$CONF_DIR/sessions.conf"
+SESS_STATE="$DATA/sessions.json"
+LEGACY_SCHED="$CONF_DIR/schedule.conf"
 
-sched_init() {
-  [[ -f $SCHED_STATE ]] || echo '{"date":"","tasks":{},"announced":{}}' >"$SCHED_STATE"
-  [[ -f $SCHED ]] && return 0
-  cat >"$SCHED" <<'SCHEDEOF'
-# pomo timetable. One block per line:
+sess_header() {
+  cat <<'HDREOF'
+# pomo sessions. One session per line, in the order you do them:
 #
-#   <days>  <start>  <minutes>  <focus>  <title>
+#   <minutes>  <focus>  <title>
 #
-#   days     daily | mon-fri | sat,sun | mon,wed,fri  (mon tue wed thu fri sat sun)
-#   start    HH:MM, 24h
-#   minutes  how long the whole block runs
-#   focus    length of each focus session inside the block
-#   title    what the notification says to do
+#   minutes  what the session is worth: focus + breaks, your daily budget
+#   focus    length of each focus session inside it
+#   title    what the session is for
 #
-# Blank lines and #comments are ignored. Edits apply on the next tick, no
-# restart needed. Check the day with:  pomo sched
+# No days, no start times. Start a session whenever you are ready:
+#
+#   pomo s start        the next unfinished one
+#   pomo s start 3      that one
+#
+# A session finishes when every task in it is ticked, not when its minutes run
+# out. The minutes only drive the progress bar and the over-budget warning.
+# Edits apply immediately, no restart needed.
 
-daily  11:00  150  50  Build app - practice project, no AI
-daily  14:30  120  50  Open source - land a PR
-daily  17:30  120  50  Reverse engineering - one binary
-daily  20:30   30  25  Write the X post about today's RE
-SCHEDEOF
-  echo "created $SCHED"
+HDREOF
 }
 
-sched_dow() { date -d "@${1:-$(now)}" +%a | tr 'A-Z' 'a-z'; }
-
-# Does a days-field like "mon-fri" or "sat,sun" or "daily" cover $2 (e.g. "wed")?
-sched_day_match() {
-  local field=$1 dow=$2 part a b all="mon tue wed thu fri sat sun" i j k
-  [[ $field == daily || $field == all || $field == everyday ]] && return 0
-  field=$(printf '%s' "$field" | tr 'A-Z' 'a-z')
-  local IFS=,
-  for part in $field; do
-    if [[ $part == *-* ]]; then
-      a=${part%%-*}
-      b=${part##*-}
-      i=0 j=-1 k=-1
-      local d n=0
-      for d in $all; do
-        [[ $d == "$a" ]] && j=$n
-        [[ $d == "$b" ]] && k=$n
-        [[ $d == "$dow" ]] && i=$n
-        n=$((n + 1))
-      done
-      ((j < 0 || k < 0)) && continue
-      if ((j <= k)); then
-        ((i >= j && i <= k)) && return 0
-      else # wraps the weekend, e.g. sat-sun or fri-mon
-        ((i >= j || i <= k)) && return 0
-      fi
-    else
-      [[ $part == "$dow" ]] && return 0
-    fi
-  done
-  return 1
-}
-
-# Today's blocks, one per line: key<TAB>start<TAB>end<TAB>focus<TAB>title
-sched_today() {
-  sched_init
-  local dow today_mid days start mins focus title rest
-  dow=$(sched_dow)
-  today_mid=$(date -d "$(date +%F) 00:00" +%s)
+# One-shot migration off the old clock-bound timetable. Blocks past the third
+# fold into the third, so the day keeps exactly the same total minutes.
+sess_migrate() {
+  [[ -f $LEGACY_SCHED ]] || return 1
+  local days start mins focus rest n=0 i
+  local -a bm=() bf=() bt=()
   while read -r days start mins focus rest; do
     [[ -z ${days:-} || $days == \#* ]] && continue
     [[ -z ${rest:-} ]] && continue
     is_num "$mins" && is_num "$focus" || continue
-    [[ $start =~ ^[0-9]{1,2}:[0-9]{2}$ ]] || continue
-    sched_day_match "$days" "$dow" || continue
-    local h=${start%%:*} m=${start##*:} s
-    h=$((10#$h)) m=$((10#$m))
-    s=$((today_mid + h * 3600 + m * 60))
-    title=$rest
-    printf '%s\t%s\t%s\t%s\t%s\n' "$start" "$s" "$((s + mins * 60))" "$focus" "$title"
-  done <"$SCHED" | sort -t"$(printf '\t')" -k2,2n
+    if ((n < 3)); then
+      bm[n]=$mins bf[n]=$focus bt[n]=$rest
+      n=$((n + 1))
+    else
+      bm[2]=$((bm[2] + mins))
+      bt[2]="${bt[2]} + $rest"
+    fi
+  done <"$LEGACY_SCHED"
+  ((n == 0)) && return 1
+  {
+    sess_header
+    for ((i = 0; i < n; i++)); do printf '%-8s %-6s %s\n' "${bm[i]}" "${bf[i]}" "${bt[i]}"; done
+  } >"$SESSIONS"
+  mv "$LEGACY_SCHED" "$LEGACY_SCHED.bak"
+  echo "pomo: migrated schedule.conf -> sessions.conf (old file kept as schedule.conf.bak)" >&2
+  return 0
 }
 
-# Reset the day's bookkeeping when the date rolls over.
-sched_roll() {
-  local today
-  today=$(date +%F)
-  [[ $(jq -r '.date' "$SCHED_STATE") == "$today" ]] && return 0
-  local t
-  t=$(mktemp)
-  jq --arg d "$today" '{date:$d,tasks:{},announced:{}}' "$SCHED_STATE" >"$t" && mv "$t" "$SCHED_STATE"
+sess_init() {
+  [[ -f $SESS_STATE ]] || echo '{"date":"","streak":0,"best":0,"announced":{},"sessions":[]}' >"$SESS_STATE"
+  [[ -f $SESSIONS ]] && return 0
+  sess_migrate && return 0
+  {
+    sess_header
+    printf '%-8s %-6s %s\n' 165 45 "Build app - practice project, no AI"
+    printf '%-8s %-6s %s\n' 165 45 "Open source - land a PR"
+    printf '%-8s %-6s %s\n' 210 45 "Reverse engineering + write the X post"
+  } >"$SESSIONS"
+  echo "created $SESSIONS"
 }
 
-sched_set() { # jq args, applied to sched.json
+# The plan for a day: n<TAB>minutes<TAB>focus<TAB>title
+sess_plan() {
+  sess_init
+  local mins focus rest n=0
+  while read -r mins focus rest; do
+    [[ -z ${mins:-} || $mins == \#* ]] && continue
+    [[ -z ${rest:-} ]] && continue
+    is_num "$mins" && is_num "$focus" || continue
+    n=$((n + 1))
+    printf '%s\t%s\t%s\t%s\n' "$n" "$mins" "$focus" "$rest"
+  done <"$SESSIONS"
+}
+
+sset() {
+  # The temp file has to sit next to the target: with TMPDIR on another
+  # filesystem, mv falls back to copy+unlink and readers see it missing.
   local t
-  t=$(mktemp)
-  if jq "$@" "$SCHED_STATE" >"$t" 2>/dev/null; then mv "$t" "$SCHED_STATE"; else
+  t=$(mktemp "$SESS_STATE.XXXXXX")
+  if jq "$@" "$SESS_STATE" >"$t" 2>/dev/null; then mv "$t" "$SESS_STATE"; else
     rm -f "$t"
     return 1
   fi
 }
 
-# The task id backing a block today, creating it the first time.
-sched_task() { # key title focus block_minutes
-  local key=$1 title=$2 focus=$3 span=$4 id
-  id=$(jq -r --arg k "$key" '.tasks[$k] // empty' "$SCHED_STATE")
-  if [[ -n $id ]] && task_exists "$id"; then
-    printf '%s' "$id"
+# Apply a jq expression to one session object. Extra jq args go after the
+# expression:  sess_apply 2 '.spent += $s' --argjson s 60
+sess_apply() { # n expr [jq args...]
+  local n=$1 expr=$2
+  shift 2
+  sset --argjson n "$n" "$@" ".sessions |= map(if .n==\$n then ($expr) else . end)"
+}
+
+sess_field() { jq -r --argjson n "$1" "[.sessions[]|select(.n==\$n)|$2]|first // empty" "$SESS_STATE"; }
+sess_exists() { [[ -n $(sess_field "$1" .n) ]]; }
+sess_running() { jq -r '[.sessions[]|select(.status=="running")|.n]|first // empty' "$SESS_STATE"; }
+sess_next() { jq -r '[.sessions[]|select(.status=="open" or .status=="idle")|.n]|first // empty' "$SESS_STATE"; }
+sess_count() { jq -r '.sessions|length' "$SESS_STATE"; }
+sess_done_count() { jq -r '[.sessions[]|select(.status=="done")]|length' "$SESS_STATE"; }
+
+# Pull edits to sessions.conf into a day already under way, without losing the
+# progress of a session that has already been worked on.
+sess_sync() {
+  local n mins focus title seen=""
+  while IFS=$'\t' read -r n mins focus title; do
+    [[ -z $n ]] && continue
+    seen+=" $n"
+    if sess_exists "$n"; then
+      sess_apply "$n" '.title=$t | .minutes=$m | .focus=$f' \
+        --arg t "$title" --argjson m "$mins" --argjson f "$focus"
+    else
+      sset --argjson n "$n" --arg t "$title" --argjson m "$mins" --argjson f "$focus" \
+        '.sessions += [{n:$n,title:$t,minutes:$m,focus:$f,status:"idle",tasks:[],warned:0}]'
+    fi
+  done < <(sess_plan)
+  # Sessions dropped from the file go too, unless something was already done in
+  # them — losing a morning's work to an edit would be worse than a stale row.
+  sset --arg keep " $seen " \
+    '.sessions |= map(select((" \(.n) " | inside($keep)) or (.tasks|length) > 0))'
+}
+
+# New day: credit yesterday, move the streak, rebuild today from the plan.
+sess_roll() {
+  sess_init
+  local today stored
+  today=$(date +%F)
+  stored=$(jq -r '.date' "$SESS_STATE")
+  [[ $stored == "$today" ]] && {
+    sess_sync
     return 0
+  }
+
+  local streak best done_n total_n
+  streak=$(jq -r '.streak // 0' "$SESS_STATE")
+  best=$(jq -r '.best // 0' "$SESS_STATE")
+  if [[ -n $stored ]]; then
+    done_n=$(sess_done_count)
+    total_n=$(sess_count)
+    if ((total_n > 0)); then
+      jq -nc --arg d "$stored" --argjson done "$done_n" --argjson of "$total_n" \
+        --argjson t "$(date -d "$stored 23:59" +%s)" \
+        '{t:$t,date:$d,phase:"day",sessions:$done,of:$of,minutes:0,task:null,title:""}' >>"$LOG"
+      if ((done_n >= total_n)) && [[ $stored == $(date -d yesterday +%F) ]]; then
+        streak=$((streak + 1))
+      else
+        streak=0
+      fi
+    fi
   fi
-  local est=$(((span + focus - 1) / focus))
+  ((streak > best)) && best=$streak
+
+  local arr='[]' n mins focus title
+  while IFS=$'\t' read -r n mins focus title; do
+    [[ -z $n ]] && continue
+    arr=$(jq -c --argjson n "$n" --argjson mins "$mins" --argjson focus "$focus" --arg title "$title" \
+      '. + [{n:$n,title:$title,minutes:$mins,focus:$focus,status:"idle",tasks:[],warned:0}]' <<<"$arr")
+  done < <(sess_plan)
+  jq -n --arg d "$today" --argjson s "$streak" --argjson b "$best" --argjson arr "$arr" \
+    '{date:$d,streak:$s,best:$b,announced:{},sessions:$arr}' >"$SESS_STATE"
+  cancel_alarm
+  jset '.phase="idle" | .task=null | .ends_at=0 | .left=0 | .cycle=0'
+  refresh_bar
+}
+
+# The session a task belongs to, or empty.
+sess_of_task() { jq -r --argjson id "$1" '[.sessions[]|select(.tasks|index($id))|.n]|first // empty' "$SESS_STATE"; }
+
+sess_open_tasks() { # n -> ids of its still-active tasks
+  local ids id
+  ids=$(jq -r --argjson n "$1" '(.sessions[]|select(.n==$n)|.tasks[])' "$SESS_STATE" 2>/dev/null)
+  [[ -z $ids ]] && return 0
+  for id in $ids; do
+    jq -e --argjson id "$id" 'any(.[]; .id==$id and .status=="active")' "$TASKS" >/dev/null 2>&1 && echo "$id"
+  done
+}
+
+sess_est() { # n -> how many focus sessions the budget is worth
+  local mins focus est
+  mins=$(sess_field "$1" .minutes)
+  focus=$(sess_field "$1" .focus)
+  ((focus < 1)) && focus=$WORK_MIN
+  est=$(((mins + focus - 1) / focus))
   ((est < 1)) && est=1
+  echo "$est"
+}
+
+# Minutes already sunk into a session, read back off the log so nothing has to
+# be double-booked when a phase is abandoned halfway.
+sess_spent() { # n -> minutes, including the phase running right now
+  local ids mins live
+  ids=$(jq -c --argjson n "$1" '[.sessions[]|select(.n==$n)|.tasks]|first // []' "$SESS_STATE")
+  mins=$(jq -s --arg d "$(date +%F)" --argjson ids "${ids:-[]}" \
+    '[.[]|select(.date==$d and (.task != null) and (.task as $t | $ids|index($t)))|.minutes]|add // 0' "$LOG")
+  if [[ $(sess_running) == "$1" ]]; then
+    case "$(sget '.phase')" in
+    work | break | long)
+      live=$((($(now) - $(sget '.started') + 30) / 60))
+      ((live > 0)) && mins=$((mins + live))
+      ;;
+    esac
+  fi
+  echo "$mins"
+}
+
+sess_focus_done() { # n -> completed focus sessions
+  local ids
+  ids=$(jq -c --argjson n "$1" '[.sessions[]|select(.n==$n)|.tasks]|first // []' "$SESS_STATE")
+  jq -s --arg d "$(date +%F)" --argjson ids "${ids:-[]}" \
+    '[.[]|select(.date==$d and .phase=="work" and (.task != null) and (.task as $t | $ids|index($t)))]|length' "$LOG"
+}
+
+sess_over() { # n -> 0 if over its minute budget
+  local spent mins
+  spent=$(sess_spent "$1")
+  mins=$(sess_field "$1" .minutes)
+  ((spent > mins))
+}
+
+# A session with no tasks yet gets one from its own title, so `s start` always
+# has something to run.
+sess_seed() { # n
+  local n=$1 have id focus title est
+  have=$(jq -r --argjson n "$n" '[.sessions[]|select(.n==$n)|.tasks|length]|first // 0' "$SESS_STATE")
+  ((have > 0)) && return 0
+  focus=$(sess_field "$n" .focus)
+  title=$(sess_field "$n" .title)
+  est=$(sess_est "$n")
   id=$(jq '[.[].id]|max // 0 | .+1' "$TASKS")
   tset --argjson id "$id" --arg title "$title" --argjson est "$est" \
     --argjson now "$(now)" --argjson wmin "$focus" \
     '. + [{id:$id,title:$title,est:$est,done:0,status:"active",created:$now,due:null,wmin:$wmin}]'
-  sched_set --arg k "$key" --arg id "$id" '.tasks[$k]=$id'
-  printf '%s' "$id"
+  sess_apply "$n" '.tasks += [$id]' --argjson id "$id"
 }
 
-# Export the timetable as an .ics calendar file, so a phone's calendar app can
-# carry the same blocks without ntfy. Times are floating: they land in whatever
-# timezone the importing calendar uses.
-sched_ics() { # [path]
-  sched_init
-  local out=${1:-$DATA/timetable.ics}
-  local days start mins focus rest byday uid dtstart dtend h m eh em total
-  # Name the timezone explicitly. Without a TZID, calendars are free to read a
-  # bare local time as UTC, which slides the whole day by the local offset.
-  local tz off
-  tz=$(timedatectl show -p Timezone --value 2>/dev/null)
-  [[ -z $tz ]] && tz=$(readlink -f /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')
-  [[ -z $tz ]] && tz=UTC
-  off=$(date +%z)
-  {
-    printf 'BEGIN:VCALENDAR\r\n'
-    printf 'VERSION:2.0\r\n'
-    printf 'PRODID:-//pomo//timetable//EN\r\n'
-    printf 'CALSCALE:GREGORIAN\r\n'
-    # A minimal fallback definition; clients that know the IANA name use their
-    # own rules instead, which is what we want.
-    printf 'BEGIN:VTIMEZONE\r\nTZID:%s\r\n' "$tz"
-    printf 'BEGIN:STANDARD\r\nDTSTART:19700101T000000\r\n'
-    printf 'TZOFFSETFROM:%s\r\nTZOFFSETTO:%s\r\nTZNAME:%s\r\n' "$off" "$off" "$tz"
-    printf 'END:STANDARD\r\nEND:VTIMEZONE\r\n'
-    while read -r days start mins focus rest; do
-      [[ -z ${days:-} || $days == \#* ]] && continue
-      [[ -z ${rest:-} ]] && continue
-      is_num "$mins" && is_num "$focus" || continue
-      [[ $start =~ ^[0-9]{1,2}:[0-9]{2}$ ]] || continue
-      byday=$(sched_byday "$days") || continue
-      h=$((10#${start%%:*})) m=$((10#${start##*:}))
-      total=$((h * 60 + m + mins))
-      eh=$(((total / 60) % 24)) em=$((total % 60))
-      dtstart=$(printf '%02d%02d00' "$h" "$m")
-      dtend=$(printf '%02d%02d00' "$eh" "$em")
-      uid=$(printf '%s %s %s' "$days" "$start" "$rest" | md5sum | cut -c1-32)
-      printf 'BEGIN:VEVENT\r\n'
-      printf 'UID:%s@pomo\r\n' "$uid"
-      printf 'DTSTAMP:%s\r\n' "$(date -u +%Y%m%dT%H%M%SZ)"
-      printf 'DTSTART;TZID=%s:%sT%s\r\n' "$tz" "$(date +%Y%m%d)" "$dtstart"
-      printf 'DTEND;TZID=%s:%sT%s\r\n' "$tz" "$(date +%Y%m%d)" "$dtend"
-      printf 'RRULE:FREQ=WEEKLY;BYDAY=%s\r\n' "$byday"
-      printf 'SUMMARY:%s\r\n' "$(ics_escape "$rest")"
-      printf 'DESCRIPTION:%s\r\n' "$(ics_escape "pomo block - ${focus}m focus sessions")"
-      printf 'BEGIN:VALARM\r\nTRIGGER:PT0M\r\nACTION:DISPLAY\r\nDESCRIPTION:%s\r\nEND:VALARM\r\n' \
-        "$(ics_escape "$rest")"
-      printf 'BEGIN:VALARM\r\nTRIGGER:-PT%dM\r\nACTION:DISPLAY\r\nDESCRIPTION:%s\r\nEND:VALARM\r\n' "${PREP_MIN:-10}" \
-        "$(ics_escape "Next up: $rest")"
-      printf 'END:VEVENT\r\n'
-    done <"$SCHED"
-    printf 'END:VCALENDAR\r\n'
-  } >"$out"
-  echo "$out"
-}
-
-ics_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/;/\;/g; s/,/\\,/g'; }
-
-# days field -> iCalendar BYDAY list, e.g. "mon-fri" -> MO,TU,WE,TH,FR
-sched_byday() {
-  local field=$1 d out=""
-  for d in mon tue wed thu fri sat sun; do
-    if sched_day_match "$field" "$d"; then
-      case $d in
-      mon) out+=",MO" ;; tue) out+=",TU" ;; wed) out+=",WE" ;; thu) out+=",TH" ;;
-      fri) out+=",FR" ;; sat) out+=",SA" ;; sun) out+=",SU" ;;
-      esac
-    fi
-  done
-  [[ -z $out ]] && return 1
-  printf '%s' "${out#,}"
-}
-
-# Publish the .ics as a secret gist and hand back a URL that Google Calendar
-# (or any calendar app) can subscribe to, so the timetable keeps itself in sync
-# without an OAuth setup. Needs the `gh` CLI, logged in with the `gist` scope.
-sched_gcal() {
-  command -v gh >/dev/null || {
-    echo "needs the gh CLI: https://cli.github.com" >&2
-    return 1
+# Called after any task is ticked. Closes the session when its list empties.
+sess_after_done() { # task_id
+  local n left total streak
+  n=$(sess_of_task "$1")
+  [[ -z $n ]] && return 0
+  left=$(sess_open_tasks "$n" | wc -l)
+  ((left > 0)) && {
+    [[ $(sess_running) == "$n" ]] &&
+      notify "󰄬  S$n · $left task(s) left" "$(task_title "$1")" low
+    return 0
   }
-  local ics id url state="$DATA/gcal.json"
-  ics=$(sched_ics "$DATA/timetable.ics") || return 1
-  [[ -f $state ]] || echo '{}' >"$state"
-  id=$(jq -r '.gist // empty' "$state")
-  if [[ -n $id ]] && gh gist view "$id" >/dev/null 2>&1; then
-    gh gist edit "$id" -f timetable.ics "$ics" >/dev/null || return 1
+  sess_apply "$n" '.status="done"'
+  if [[ $(sget '.phase') != idle ]] && [[ $(sess_of_task "$(sget '.task')") == "$n" || $(sget '.task') == null ]]; then
+    cancel_alarm
+    jset '.phase="idle" | .task=null | .ends_at=0 | .left=0'
+  fi
+  total=$(sess_count)
+  local dn
+  dn=$(sess_done_count)
+  if ((dn >= total)); then
+    streak=$(($(jq -r '.streak // 0' "$SESS_STATE") + 1))
+    notify "󰄬  $dn/$total today" "Whole day cleared · streak $((streak))d" critical "$SOUND_END"
   else
-    url=$(gh gist create --desc "pomo timetable" -f timetable.ics "$ics" 2>/dev/null) || {
-      echo "could not create the gist. Check: gh auth status" >&2
+    notify "󰄬  Session $n done" "$((total - dn)) session(s) left today" critical "$SOUND_END"
+  fi
+  refresh_bar
+}
+
+# --- session commands -------------------------------------------------------
+
+cmd_sess_start() {
+  sess_roll
+  local n=${1:-} run
+  run=$(sess_running)
+  if [[ -n $n ]]; then
+    is_num "$n" || {
+      echo "usage: pomo s start [n]" >&2
       return 1
     }
-    id=${url##*/}
-    jq -n --arg g "$id" '{gist:$g}' >"$state"
+    sess_exists "$n" || {
+      echo "no session $n today (there are $(sess_count))" >&2
+      return 1
+    }
   fi
-  local user
-  user=$(gh api user -q .login 2>/dev/null)
-  url="https://gist.githubusercontent.com/$user/$id/raw/timetable.ics"
-  echo "$url"
+  if [[ -n $run ]]; then
+    if [[ -z $n || $n == "$run" ]]; then
+      n=$run
+    else
+      echo "session $run is running. stop it first: pomo s stop" >&2
+      return 1
+    fi
+  fi
+  [[ -z $n ]] && n=$(sess_next)
+  [[ -z $n ]] && {
+    notify "󰄬  Nothing left" "$(sess_done_count)/$(sess_count) sessions done today" low
+    echo "all sessions done today"
+    return 0
+  }
+  [[ $(sess_field "$n" .status) == done ]] && {
+    echo "session $n is already done" >&2
+    return 1
+  }
+  sess_seed "$n"
+  local id
+  id=$(sess_open_tasks "$n" | head -1)
+  [[ -z $id ]] && {
+    echo "session $n has no open tasks. add one: pomo s add \"...\"" >&2
+    return 1
+  }
+  sess_apply "$n" '.status="running"'
+  cmd_start -q "$id" >/dev/null || return 1
+  notify "󰔟  S$n · focus $(jq -r --argjson id "$id" '(.[]|select(.id==$id)|.wmin) // empty' "$TASKS")m" \
+    "$(task_title "$id")" normal "$SOUND_START"
+  cmd_session
 }
 
-# Fires every 30s from pomo-sched.timer.
-cmd_sched_tick() {
-  sched_init
-  sched_roll
-  local n blocks
-  n=$(now)
-  blocks=$(sched_today)
-  [[ -z $blocks ]] && return 0
+cmd_sess_stop() {
+  sess_roll
+  local n
+  n=$(sess_running)
+  cmd_stop >/dev/null
+  [[ -z $n ]] && {
+    echo "no session running"
+    return 0
+  }
+  sess_apply "$n" '.status="open"'
+  refresh_bar
+  echo "session $n halted, $(sess_open_tasks "$n" | wc -l) task(s) still open"
+}
 
-  # Morning push: the whole day, on the phone, before any of it starts.
-  if [[ -n ${AGENDA_AT:-} && $(jq -r '.announced.agenda // empty' "$SCHED_STATE") != 1 ]]; then
+cmd_sess_add() { # add a task to a session
+  sess_roll
+  local n="" est=1 title=""
+  while (($#)); do
+    case "$1" in
+    -s | --session)
+      n=$2
+      shift 2
+      ;;
+    -e | --est)
+      est=$2
+      shift 2
+      ;;
+    *)
+      title+="${title:+ }$1"
+      shift
+      ;;
+    esac
+  done
+  [[ -z $title ]] && {
+    echo "usage: pomo s add <title> [-s n] [-e pomodoros]" >&2
+    return 1
+  }
+  [[ -z $n ]] && n=$(sess_running)
+  [[ -z $n ]] && n=$(sess_next)
+  [[ -z $n ]] && {
+    echo "no session left today" >&2
+    return 1
+  }
+  sess_exists "$n" || {
+    echo "no session $n today" >&2
+    return 1
+  }
+  local id focus
+  focus=$(sess_field "$n" .focus)
+  id=$(jq '[.[].id]|max // 0 | .+1' "$TASKS")
+  tset --argjson id "$id" --arg title "$title" --argjson est "${est:-1}" \
+    --argjson now "$(now)" --argjson wmin "$focus" \
+    '. + [{id:$id,title:$title,est:$est,done:0,status:"active",created:$now,due:null,wmin:$wmin}]'
+  sess_apply "$n" '.tasks += [$id]' --argjson id "$id"
+  echo "added #$id to session $n  $title"
+  refresh_bar
+}
+
+cmd_sess_skip() {
+  sess_roll
+  local n=${1:-}
+  [[ -z $n ]] && n=$(sess_running)
+  [[ -z $n ]] && n=$(sess_next)
+  [[ -z $n ]] && {
+    echo "nothing to skip" >&2
+    return 1
+  }
+  sess_exists "$n" || {
+    echo "no session $n today" >&2
+    return 1
+  }
+  [[ $(sess_running) == "$n" ]] && cmd_stop >/dev/null
+  sess_apply "$n" '.status="missed"'
+  refresh_bar
+  echo "session $n marked missed"
+}
+
+fmt_hm() { # minutes -> 2h45
+  printf '%dh%02d' $(($1 / 60)) $(($1 % 60))
+}
+
+# The checklist: what today is made of and where you are in it.
+cmd_session() {
+  sess_roll
+  local total dn streak
+  total=$(sess_count)
+  dn=$(sess_done_count)
+  streak=$(jq -r '.streak' "$SESS_STATE")
+  printf 'Today  ·  %s/%s sessions  ·  streak %sd\n\n' "$dn" "$total" "$streak"
+  local n title mins focus status mark fd est spent flag id ttitle tstatus tdone test
+  while IFS=$'\t' read -r n title mins focus status; do
+    [[ -z $n ]] && continue
+    case "$status" in
+    done) mark="[x]" ;;
+    running) mark="[>]" ;;
+    open) mark="[~]" ;;
+    missed) mark="[!]" ;;
+    *) mark="[ ]" ;;
+    esac
+    fd=$(sess_focus_done "$n")
+    est=$(sess_est "$n")
+    spent=$(sess_spent "$n")
+    flag=""
+    ((spent > mins)) && flag="  over"
+    printf '%s S%s  %-44.44s %s/%s focus   %s / %s%s\n' \
+      "$mark" "$n" "$title" "$fd" "$est" "$(fmt_hm "$spent")" "$(fmt_hm "$mins")" "$flag"
+    while IFS=$'\t' read -r id ttitle tstatus tdone test; do
+      [[ -z $id ]] && continue
+      printf '      [%s] #%s  %-38.38s %s/%s\n' \
+        "$([[ $tstatus == done ]] && echo x || echo ' ')" "$id" "$ttitle" "$tdone" "$test"
+    done < <(jq -r --argjson n "$n" --slurpfile s "$SESS_STATE" '
+        ($s[0].sessions[]|select(.n==$n)|.tasks) as $ids
+        | [.[]|select(.id as $i | $ids|index($i))]|.[]|[.id,.title,.status,.done,.est]|@tsv' "$TASKS")
+  done < <(jq -r '.sessions[]|[.n,.title,.minutes,.focus,.status]|@tsv' "$SESS_STATE")
+}
+
+cmd_streak() {
+  sess_roll
+  local streak best
+  streak=$(jq -r '.streak' "$SESS_STATE")
+  best=$(jq -r '.best' "$SESS_STATE")
+  printf 'streak %sd   best %sd   today %s/%s\n\n' "$streak" "$best" "$(sess_done_count)" "$(sess_count)"
+  echo "last 14 days:"
+  jq -rs --argjson since "$(date -d '14 days ago' +%s)" '
+    [.[]|select(.phase=="day" and .t>=$since)]
+    | if length==0 then "  (nothing logged yet)" else
+        .[] | "  \(.date)  \(.sessions)/\(.of)  " + ("#"*.sessions) + ("."*(.of-.sessions))
+      end' "$LOG"
+}
+
+cmd_sess_edit() {
+  sess_init
+  "${EDITOR:-nano}" "$SESSIONS"
+  sess_roll
+  cmd_session
+}
+
+# Fires every 30s from pomo-tick.timer. It never starts anything: the day rolls
+# over here, and the phone gets its two nudges.
+cmd_tick() {
+  sess_roll
+  local n dn total
+  dn=$(sess_done_count)
+  total=$(sess_count)
+
+  if [[ -n ${AGENDA_AT:-} && $(jq -r '.announced.agenda // empty' "$SESS_STATE") != 1 ]]; then
     local ah=${AGENDA_AT%%:*} am=${AGENDA_AT##*:} amid
     amid=$(date -d "$(date +%F) 00:00" +%s)
     amid=$((amid + 10#$ah * 3600 + 10#$am * 60))
-    if ((n >= amid)); then
-      sched_set '.announced.agenda=1'
-      push "󰃭  Today" "$(cmd_sched)" critical
+    if (($(now) >= amid)); then
+      sset '.announced.agenda=1'
+      push "󰃭  $total sessions today" "$(cmd_session)" critical
     fi
   fi
 
-  local key start end focus title cur_key="" cur_start=0 cur_end=0 cur_focus=0 cur_title=""
-  while IFS=$'\t' read -r key start end focus title; do
-    [[ -z $key ]] && continue
-    if ((n >= start && n < end)); then
-      cur_key=$key cur_start=$start cur_end=$end cur_focus=$focus cur_title=$title
-    elif ((n < start)); then
-      # Heads-up a few minutes early, so a block opening is never a surprise.
-      if ((${PREP_MIN:-0} > 0 && start - n <= ${PREP_MIN:-0} * 60)) &&
-        [[ $(jq -r --arg k "pre:$key" '.announced[$k] // empty' "$SCHED_STATE") != 1 ]]; then
-        sched_set --arg k "pre:$key" '.announced[$k]=1'
-        notify "󰀠  In $(((start - n + 59) / 60)) min — get ready" \
-          "$title
-starts $(date -d "@$start" +%H:%M)" critical "$SOUND_DUE"
-      fi
-    else
-      # Block is over: close its task out so the checklist shows it ticked.
-      local past
-      past=$(jq -r --arg k "$key" '.tasks[$k] // empty' "$SCHED_STATE")
-      if [[ -n $past ]] && task_exists "$past" &&
-        [[ $(jq -r --argjson id "$past" '(.[]|select(.id==$id)|.status)' "$TASKS") == active ]]; then
-        tset --argjson id "$past" 'map(if .id==$id then .status="done" else . end)'
-        if [[ $(sget '.task') == "$past" ]]; then
-          case "$(sget '.phase')" in
-          work | paused) cmd_stop >/dev/null ;;
-          esac
-          jset '.task=null'
-        fi
-        refresh_bar
-      fi
-    fi
-  done <<<"$blocks"
-
-  local phase
-  phase=$(sget '.phase')
-
-  if [[ -z $cur_key ]]; then
-    # Outside every block. Stop a session left running from one that ended.
-    if [[ $phase == work ]]; then
-      local t
-      t=$(sget '.task')
-      if [[ $t != null ]] &&
-        jq -e --argjson id "$t" 'any(.[]; .id==$id and .status=="done")' "$TASKS" >/dev/null 2>&1; then
-        cmd_stop >/dev/null
-      fi
-    fi
-    return 0
+  # One warning per session when it runs past its own budget.
+  n=$(sess_running)
+  if [[ -n $n && $(sess_field "$n" .warned) != 1 ]] && sess_over "$n"; then
+    sess_apply "$n" '.warned=1'
+    notify "󰀠  S$n over budget" \
+      "$(fmt_hm "$(sess_spent "$n")") of $(fmt_hm "$(sess_field "$n" .minutes)") · $(sess_open_tasks "$n" | wc -l) task(s) left" \
+      critical "$SOUND_DUE"
   fi
-
-  local id
-  id=$(sched_task "$cur_key" "$cur_title" "$cur_focus" $(((cur_end - cur_start) / 60)))
-
-  # Announce the block once, the moment it opens.
-  if [[ $(jq -r --arg k "$cur_key" '.announced[$k] // empty' "$SCHED_STATE") != 1 ]]; then
-    sched_set --arg k "$cur_key" '.announced[$k]=1'
-    notify "󰃭  $(date -d "@$cur_start" +%H:%M) — now do this" \
-      "$cur_title
-until $(date -d "@$cur_end" +%H:%M)" critical "$SOUND_DUE"
-  fi
-
-  case "$phase" in
-  break | long) return 0 ;; # a break is earned, let it run
-  work)
-    [[ $(sget '.task') == "$id" ]] && return 0
-    ;;
-  esac
-
-  # Idle, paused, or drifted onto something else: put the block back on.
-  # A session runs its full length or not at all — a truncated stub is worse
-  # than ending the block a few minutes early.
-  local left=$(((cur_end - n) / 60))
-  ((left < cur_focus)) && return 0
-  cancel_alarm
-  cmd_start "$id" -m "$cur_focus" >/dev/null
 }
-
-# The checklist: what today looks like and where you are in it.
-cmd_sched() {
-  case "${1:-}" in
-  tick)
-    cmd_sched_tick
-    return $?
-    ;;
-  edit)
-    sched_init
-    "${EDITOR:-nano}" "$SCHED"
-    return $?
-    ;;
-  ics)
-    shift
-    sched_ics "$@"
-    return $?
-    ;;
-  gcal)
-    sched_gcal
-    return $?
-    ;;
-  on)
-    systemctl --user enable --now pomo-sched.timer
-    return $?
-    ;;
-  off)
-    systemctl --user disable --now pomo-sched.timer
-    return $?
-    ;;
-  esac
-  sched_init
-  sched_roll
-  local n blocks
-  n=$(now)
-  blocks=$(sched_today)
-  if [[ -z $blocks ]]; then
-    echo "nothing scheduled today. edit $SCHED"
-    return 0
-  fi
-  local key start end focus title mark id prog
-  while IFS=$'\t' read -r key start end focus title; do
-    [[ -z $key ]] && continue
-    if ((n >= end)); then
-      mark="[x]"
-    elif ((n >= start)); then
-      mark="[>]"
-    else
-      mark="[ ]"
-    fi
-    prog=""
-    id=$(jq -r --arg k "$key" '.tasks[$k] // empty' "$SCHED_STATE")
-    [[ -n $id ]] && task_exists "$id" &&
-      prog=$(jq -r --argjson id "$id" '(.[]|select(.id==$id)|"  (\(.done)/\(.est))") // ""' "$TASKS")
-    printf '%s %s-%s  %s%s\n' "$mark" "$key" "$(date -d "@$end" +%H:%M)" "$title" "$prog"
-  done <<<"$blocks"
-}
-
 cmd_push() { # phone mirroring: pomo push [test|<message>]
   if [[ -z ${NTFY_TOPIC:-} ]]; then
     echo "no NTFY_TOPIC set. Add one to $CONF, then subscribe to the same" >&2
@@ -943,22 +1064,34 @@ cmd_due_check() {
 cmd_nag() {
   cmd_due_check
   ((NAG_MIN == 0)) && return 0
+  sess_roll
   [[ $(sget '.phase') != idle ]] && return 0
-  local pending top
-  pending=$(jq '[.[]|select(.status=="active")]|length' "$TASKS")
-  ((pending == 0)) && return 0
-  top=$(jq -r 'map(select(.status=="active"))|sort_by(.due // 9999999999, .created)|.[0].title' "$TASKS")
-  notify "󰔟  Timer idle" "$pending task(s) waiting. Next: $top" normal "$SOUND_START"
+  local dn total run nx
+  dn=$(sess_done_count)
+  total=$(sess_count)
+  ((total == 0)) && return 0
+  ((dn >= total)) && return 0
+  run=$(sess_running)
+  if [[ -n $run ]]; then
+    notify "󰔟  S$run is halted" \
+      "$(sess_open_tasks "$run" | wc -l) task(s) left · Super+Alt+P to pick it back up" \
+      normal "$SOUND_START"
+    return 0
+  fi
+  nx=$(sess_next)
+  [[ -z $nx ]] && return 0
+  notify "󰔟  $dn/$total sessions today" "S$nx: $(sess_field "$nx" .title)" normal "$SOUND_START"
 }
 
 cmd_daily() {
-  local done_today mins tasks_done
-  done_today=$(grep -c "\"date\":\"$(date +%F)\",\"phase\":\"work\"" "$LOG" 2>/dev/null || echo 0)
+  sess_roll
+  local dn total mins pom
+  dn=$(sess_done_count)
+  total=$(sess_count)
+  pom=$(jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")]|length' "$LOG")
   mins=$(jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")|.minutes]|add // 0' "$LOG")
-  tasks_done=$(jq '[.[]|select(.status=="done")]|length' "$TASKS")
-  local left
-  left=$(jq '[.[]|select(.status=="active")]|length' "$TASKS")
-  notify "󰃰  Today: $done_today pomodoros, ${mins}m focus" "$tasks_done done all-time · $left still open" normal
+  notify "󰃰  $dn/$total sessions · ${mins}m focus" \
+    "$pom pomodoros · streak $(jq -r '.streak' "$SESS_STATE")d" normal
 }
 
 cmd_report() {
@@ -980,51 +1113,59 @@ cmd_report() {
 # --- waybar -----------------------------------------------------------------
 
 cmd_waybar() {
-  local phase task left ends started title pending next_title text class tooltip prog
+  sess_roll
+  local phase task ends left text class tooltip
   IFS=$'\t' read -r phase task ends left < <(jq -r '[.phase,(.task|tostring),(.ends_at|tostring),(.left|tostring)]|@tsv' "$STATE")
-  IFS=$'\t' read -r pending title next_title prog < <(jq -r --argjson id "${task:-null}" '
-    [ ([.[]|select(.status=="active")]|length|tostring),
-      ((.[]|select(.id==$id)|.title) // ""),
-      ((map(select(.status=="active"))|sort_by(.due // 9999999999,.created)|.[0].title) // ""),
-      ((.[]|select(.id==$id)|"\(.done)/\(.est)") // "")
-    ]|@tsv' "$TASKS")
+
+  local total dn sn nx over=0 prog=""
+  total=$(sess_count)
+  dn=$(sess_done_count)
+  sn=$(sess_running)
+  [[ -z $sn ]] && sn=$(sess_of_task "${task:-null}")
+  nx=$(sess_next)
+  [[ -n $sn ]] && sess_over "$sn" && over=1
+  [[ -n $sn ]] && prog=" · S$sn $(sess_focus_done "$sn")/$(sess_est "$sn")"
+
+  if ((total == 0)); then
+    jq -nc '{text:"󰔛",class:"idle",tooltip:"no sessions configured — pomo s edit"}'
+    return 0
+  fi
+
+  tooltip=$(cmd_session)$'\n\n'"Click: start/pause · Right-click: menu"
 
   case "$phase" in
-  idle)
-    class=idle
-    if ((pending > 0)); then
-      text="󰔛 $pending"
-      tooltip="Idle · $pending task(s) pending"$'\n'"Next: ${title:-$next_title}"$'\n\n'"Click: start · Right-click: menu"
-    else
-      text="󰔛"
-      tooltip="No tasks"$'\n\n'"Right-click: menu"
-    fi
+  work)
+    class=work
+    text="󰔟 $(fmt_clock $((ends - $(now))))$prog"
+    ;;
+  break | long)
+    class=$phase
+    text="󰅶 $(fmt_clock $((ends - $(now))))${sn:+ · S$sn}"
     ;;
   paused)
     class=paused
-    text="󰏤 $(fmt_clock "$left")"
-    tooltip="Paused · ${title:-no task} ${prog:+($prog)}"$'\n\n'"Click: resume · Right-click: menu"
+    text="󰏤 $(fmt_clock "$left")${sn:+ · S$sn}"
     ;;
   *)
-    left=$((ends - $(now)))
-    ((left < 0)) && left=0
-    case "$phase" in
-    work)
-      class=work
-      text="󰔟 $(fmt_clock "$left")"
-      ;;
-    break)
-      class=break
-      text="󰅶 $(fmt_clock "$left")"
-      ;;
-    long)
-      class=long
-      text="󰅶 $(fmt_clock "$left")"
-      ;;
-    esac
-    tooltip="$(phase_label "$phase") · ${title:-no task} ${prog:+($prog)}"$'\n\n'"Click: pause · Right-click: menu"
+    if ((dn >= total)); then
+      class=alldone
+      text="󰄬 $dn/$total · $(jq -r '.streak' "$SESS_STATE")d"
+    elif [[ -n $(sess_running) ]]; then
+      class=ready
+      text="󰔛 S$(sess_running)$prog"
+    elif [[ -n $nx ]]; then
+      class=idle
+      text="󰔛 S$nx · $dn/$total"
+    else
+      class=idle
+      text="󰔛 $dn/$total"
+    fi
     ;;
   esac
+  ((over)) && {
+    text+=" 󰀦"
+    class=over
+  }
   jq -nc --arg text "$text" --arg class "$class" --arg tooltip "$tooltip" \
     '{text:$text,class:$class,tooltip:$tooltip}'
 }
@@ -1092,6 +1233,17 @@ cmd_ui_break() { # one-off break of a chosen length (type any number)
   cmd_break -m "$mins" >/dev/null
 }
 
+cmd_ui_sess_add() { # [n] — task text straight into a session
+  local n=${1:-} text
+  text=$(walker -d -I -p "Task for session ${n:-next}" -e 2>/dev/null)
+  text=$(echo "$text" | sed 's/^ *//;s/ *$//')
+  [[ -z $text ]] && return 0
+  local args=("$text")
+  [[ -n $n ]] && args+=(-s "$n")
+  cmd_sess_add "${args[@]}" >/dev/null &&
+    notify "󰐕  Added to S${n:-$(sess_next)}" "$text" low
+}
+
 cmd_ui_pick() {
   local id
   id=$(walker_pick_task "Focus on") || return 0
@@ -1122,7 +1274,7 @@ cmd_ui_new() { # name + length in one flow, then start it
     walker -d -I -p "Minutes  (enter for ${WORK_MIN}, or type)" -e 2>/dev/null | tr -dc '0-9')
   mins=${mins:-$WORK_MIN}
   ((mins < 1 || mins > 600)) && {
-    notify "6  Bad length" "Enter 1-600 minutes" normal
+    notify "󰀦  Bad length" "Enter 1-600 minutes" normal
     return 1
   }
   id=$(cmd_add "$name" -m "$mins" | grep -oE '#[0-9]+' | tr -dc '0-9')
@@ -1132,69 +1284,121 @@ cmd_ui_new() { # name + length in one flow, then start it
 }
 
 cmd_menu() {
-  local phase choice
+  sess_roll
+  local phase run nx choice pick
   phase=$(sget '.phase')
-  local toggle_label
+  run=$(sess_running)
+  nx=$(sess_next)
+  local -a lines=()
   case "$phase" in
-  idle) toggle_label="5  Resume last" ;;
-  paused) toggle_label="5  Resume" ;;
-  *) toggle_label="4  Pause" ;;
+  work | break | long) lines+=("󰏤  Pause") ;;
+  paused) lines+=("󰐊  Resume") ;;
   esac
-  choice=$(printf '%s\n' \
-    "4  New timer" \
-    "$toggle_label" \
-    "b  Stop timer" \
-    "a  History" |
-    walker -d -p "Pomodoro" -e 2>/dev/null)
+  [[ -n $nx ]] && lines+=("󰐊  Start session $nx — $(sess_field "$nx" .title)")
+  lines+=("󰄲  Tick a task")
+  pick=${run:-$nx}
+  [[ -n $pick ]] && lines+=("󰐕  Add task to session $pick")
+  lines+=("󰃭  Today's checklist")
+  [[ -n $run ]] && lines+=("󰓛  Stop session $run")
+  lines+=("󰄬  Streak & history")
+  choice=$(printf '%s\n' "${lines[@]}" | walker -d -p "Sessions" -e 2>/dev/null)
   case "$choice" in
-  *"New timer") cmd_ui_new ;;
-  *Resume* | *Pause) cmd_toggle >/dev/null ;;
-  *Stop*) cmd_stop >/dev/null ;;
-  *History*) notify "a  Pomodoro history" "$(cmd_report | head -14)" normal ;;
+  *Pause | *Resume) cmd_toggle >/dev/null ;;
+  *"Start session"*) cmd_sess_start "$(grep -oE 'session [0-9]+' <<<"$choice" | tr -dc '0-9')" >/dev/null ;;
+  *"Tick a task"*) cmd_ui_done ;;
+  *"Add task to session"*) cmd_ui_sess_add "$(grep -oE 'session [0-9]+' <<<"$choice" | tr -dc '0-9')" ;;
+  *checklist*) notify "󰃭  Today" "$(cmd_session)" normal ;;
+  *"Stop session"*) cmd_sess_stop >/dev/null ;;
+  *Streak*) notify "󰄬  Streak" "$(cmd_streak)" normal ;;
+  esac
+}
+
+# --- dispatch ---------------------------------------------------------------
+
+cmd_sess() {
+  local sub=${1:-list}
+  shift 2>/dev/null || true
+  case "$sub" in
+  start | go) cmd_sess_start "$@" ;;
+  stop | halt) cmd_sess_stop ;;
+  add) cmd_sess_add "$@" ;;
+  done | tick-task) cmd_done "$@" ;;
+  skip) cmd_sess_skip "$@" ;;
+  edit) cmd_sess_edit ;;
+  streak) cmd_streak ;;
+  tick) cmd_tick ;;
+  on) systemctl --user enable --now pomo-tick.timer ;;
+  off) systemctl --user disable --now pomo-tick.timer ;;
+  list | ls) cmd_session ;;
+  *)
+    echo "unknown: pomo s $sub" >&2
+    return 1
+    ;;
   esac
 }
 
 usage() {
   cat <<'USAGE'
-pomo — pomodoro timer with task tracking
+pomo — three sessions a day, started whenever you are ready
+
+sessions
+  pomo                          today's checklist (same as `pomo s`)
+  pomo s start [n]              start the next unfinished session, or session n
+  pomo s stop                   halt the running session, keep its progress
+  pomo s add <title> [-s n] [-e N]
+                                add a task to a session (default: the running one)
+  pomo s done [id]              tick a task; the session closes when its list empties
+  pomo s skip [n]               mark a session missed on purpose
+  pomo s edit                   edit ~/.config/pomo/sessions.conf
+  pomo s on | off               enable/disable the background tick timer
+  pomo streak                   streak, best, and the last 14 days
+
+A session is finished when every task in it is ticked. Its minutes are a
+budget, not a deadline: run over and the bar turns amber, nothing stops.
 
 tasks
   pomo add <title> [-e N] [-d "time"] [-m MIN]
-                                        add task (N = estimated pomodoros, due parsed by `date -d`,
-                                        MIN = focus length for this task)
-  pomo len <id> <MIN|default>           change a task's focus length
-  pomo ls [-a]                          list tasks (-a includes done)
-  pomo show                             pop the task list as a notification
-  pomo use <id>                         set current task
-  pomo done [id]                        mark done (default: current)
-  pomo rm <id>                          delete a task (aliases: del, delete, remove)
+                                add a loose task (not attached to a session)
+  pomo len <id> <MIN|default>   change a task's focus length
+  pomo ls [-a]                  list tasks (-a includes done)
+  pomo show                     pop the task list as a notification
+  pomo use <id>                 set current task
+  pomo done [id]                mark done (default: current)
+  pomo rm <id>                  delete a task (aliases: del, delete, remove)
 
 timer
-  pomo start [id] [-m MIN]   start a focus session (MIN overrides the default length)
-  pomo break [-m MIN]        start a break now
+  pomo start [id] [-m MIN]      start a focus session by hand
+  pomo break [-m MIN]           start a break now
   pomo pause | resume | toggle | stop | skip
-  pomo status          one-line status
-  pomo report          today + last 7 days
+  pomo status                   one-line status
+  pomo report                   today + last 7 days
 
 ui (walker)
-  pomo menu            New timer / pause / stop / history
-  pomo ui-new          prompt name + minutes, then start
-  pomo ui-add | ui-pick | ui-done | ui-custom | ui-break
-                       older prompts (still work, not in menu)
+  pomo menu                     start / tick / add / checklist / streak
+  pomo ui-new | ui-add | ui-pick | ui-done | ui-custom | ui-break
 
 integration
-  pomo waybar          JSON for a waybar custom module
-  pomo nag             idle nudge + due-task check (systemd timer)
-  pomo daily           end-of-day summary (systemd timer)
+  pomo waybar                   JSON for a waybar custom module
+  pomo tick                     day roll + agenda + over-budget ping (systemd timer)
+  pomo nag                      idle nudge + due-task check (systemd timer)
+  pomo daily                    end-of-day summary (systemd timer)
 
-config: ~/.config/pomo/config.env
-data:   ~/.local/share/pomo/
+config:    ~/.config/pomo/config.env
+sessions:  ~/.config/pomo/sessions.conf
+data:      ~/.local/share/pomo/
 USAGE
 }
 
-cmd=${1:-status}
+cmd=${1:-session}
 shift 2>/dev/null || true
 case "$cmd" in
+s | session | sessions) cmd_sess "$@" ;;
+streak) cmd_streak ;;
+tick) cmd_tick ;;
+sched)
+  echo "pomo: 'sched' is now 'pomo s' — sessions, no clock" >&2
+  cmd_sess "$@"
+  ;;
 add) cmd_add "$@" ;;
 ls | list) cmd_ls "$@" ;;
 use) cmd_use "$@" ;;
@@ -1212,7 +1416,6 @@ status) cmd_status ;;
 report) cmd_report ;;
 waybar) cmd_waybar ;;
 nag) cmd_nag ;;
-sched) cmd_sched "$@" ;;
 push) cmd_push "$@" ;;
 daily) cmd_daily ;;
 menu) cmd_menu ;;

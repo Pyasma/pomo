@@ -1,30 +1,70 @@
 # pomo
 
-A pomodoro timer that runs your day for you.
+Three sessions a day, started whenever you are ready.
 
-Normal pomodoro apps assume you will open them and press start. That is the
-part that fails. `pomo` inverts it: you write the day down once, and a systemd
-timer starts each block on its own, tells you what you are supposed to be doing,
-and puts you back on it when you drift.
+A timetable fails the moment you miss the 09:00 it insists on. `pomo` drops the
+clock: the day is a fixed amount of work split into a few sessions, and you
+start one whenever you sit down. A session is finished when its tasks are
+ticked, not when the hour is up.
 
 Built for Linux — notifications through `notify-send`, an optional waybar
 module, optional Hyprland keybinds, optional push to your phone.
 
-- warns you `PREP_MIN` minutes before a block (10 by default), so it never
-  arrives cold
-- announces a block the moment it opens, and creates a task for it
-- starts the focus session — nothing to press
-- puts you back on the block's task if the timer is idle, paused, or on
-  something else (breaks are left alone)
-- runs every session at its full length: if less than `focus` minutes are left
-  in the block, it starts nothing rather than a stub
-- marks the task done and stops the timer when the block's window closes
+## The sessions
+
+`~/.config/pomo/sessions.conf`:
 
 ```
-pomo sched          # today's checklist: [x] done, [>] now, [ ] later
-pomo sched edit     # change the timetable
-pomo sched on|off   # enable / disable the tick
+# <minutes>  <focus>  <title>
+165  45  Build app - practice project, no AI
+165  45  Open source - land a PR
+210  45  Reverse engineering + write the X post
 ```
+
+- `minutes` — what the session is worth, rests included. Three 45-minute focus
+  sessions with a 15-minute rest between them is `165`. This is a budget, not a
+  deadline: run over and the bar turns amber, nothing stops.
+- `focus` — one focus session inside it. Rests come from `BREAK_MIN`.
+
+No days, no start times. A session runs when you start it:
+
+```
+pomo                # today's checklist
+pomo s start        # the next unfinished session
+pomo s start 3      # that one
+pomo s add "open the PR" -e 2
+pomo s done 4       # tick a task
+pomo s stop         # halt, keep the progress
+pomo s skip 2       # write a session off on purpose
+pomo s edit         # change what the sessions are
+pomo streak         # streak, best, last 14 days
+```
+
+The checklist:
+
+```
+Today  ·  1/3 sessions  ·  streak 4d
+
+[x] S1  Build app - practice project, no AI     3/3 focus   2h45 / 2h45
+[>] S2  Open source - land a PR                 1/4 focus   0h45 / 2h45
+      [x] #4  read the issue tracker            1/1
+      [ ] #5  repro the bug                     0/2
+      [ ] #6  open the PR                       0/1
+[ ] S3  Reverse engineering + write the X post  0/5 focus   0h00 / 3h30
+```
+
+A session closes itself the moment its last task is ticked. Sessions you never
+finish are written off at midnight, and the streak — days where all three were
+done — resets.
+
+`pomo-tick.timer` ticks every 30 seconds. It starts nothing: it rolls the day
+over, pushes the morning agenda, and warns once when a session runs past its
+budget.
+
+Upgrading from the old timetable: the first run converts `schedule.conf` into
+`sessions.conf` on its own, folding any block past the third into the third so
+the day keeps the same total minutes. The old file is kept as
+`schedule.conf.bak`.
 
 ## Tasks and timer
 
@@ -42,18 +82,13 @@ pomo status | report
 
 ## Getting it on your phone
 
-Two ways, and they work together.
-
 **Push (instant).** Set `NTFY_TOPIC` in `~/.config/pomo/config.env` to a long
 random string, subscribe to the same string in the [ntfy](https://ntfy.sh) app,
 and every urgent alert lands on your phone. The topic name is the only secret,
 so keep it private.
 
-**Calendar (the day at a glance).** `pomo sched ics` writes an `.ics` file you
-can import into any calendar. `pomo sched gcal` publishes it as a secret gist
-and prints a URL — subscribe to that URL in Google Calendar ("Other calendars"
-→ "From URL") and the calendar re-reads it on its own whenever the timetable
-changes.
+**Calendar.** Gone with the clock — there is nothing left to put in a calendar
+slot. `AGENDA_AT` pushes the day's checklist each morning instead.
 
 ## Install
 

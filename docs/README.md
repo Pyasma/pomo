@@ -11,11 +11,12 @@ Pomodoro timer with task tracking, integrated into Omarchy (Hyprland + waybar + 
 | Data | `~/.local/share/pomo/{tasks.json,state.json,log.jsonl}` |
 | Waybar module | `custom/pomodoro` in `~/.config/waybar/config.jsonc` (signal 11) |
 | Keybinds | bottom of `~/.config/hypr/bindings.conf` |
-| Reminder timers | `~/.config/systemd/user/pomo-{nag,daily}.timer` |
+| Sessions | `~/.config/pomo/sessions.conf`, state in `~/.local/share/pomo/sessions.json` |
+| Timers | `~/.config/systemd/user/pomo-{nag,daily,tick}.timer` |
 
 ## Keybinds
 
-- `Super+Alt+P` — start / pause / resume
+- `Super+Alt+P` — start the next session / pause / resume
 - `Super+Alt+Shift+P` — stop
 - `Super+Alt+T` — add task (walker prompt: `title | est | due | minutes`)
 - `Super+Alt+O` — pick task and start focusing
@@ -37,8 +38,14 @@ Pomodoro timer with task tracking, integrated into Omarchy (Hyprland + waybar + 
 
 ## Waybar
 
-Left-click toggles the timer, right-click opens the menu, middle-click stops.
-Icons: `󰔛` idle (with pending task count), `󰔟` focus, `󰅶` break, `󰏤` paused.
+Left-click starts the next session or pauses the running one, right-click opens
+the menu, middle-click halts the session.
+
+Icons: `󰔛` idle (next session and how many are done), `󰔟` focus, `󰅶` break,
+`󰏤` paused, `󰄬` all three done (with the streak), `󰀦` past the session's budget.
+
+Classes for `style.css`: `idle`, `ready`, `work`, `break`, `long`, `paused`,
+`over`, `alldone`.
 
 ## CLI
 
@@ -52,7 +59,10 @@ pomo break [-m MIN]                           # start a break of your own length
 pomo len <id> <MIN|default>                   # change a task's focus length
 pomo done [id] | rm <id> | use <id>
 pomo status | report
-pomo sched [edit|on|off|ics|gcal]             # timetable / today's checklist
+pomo                                          # today's checklist
+pomo s start [n] | stop | skip [n] | edit     # sessions
+pomo s add "open the PR" [-s n] [-e N]        # a task inside a session
+pomo streak                                   # streak, best, last 14 days
 pomo push [test]                              # phone push over ntfy
 ```
 
@@ -81,51 +91,58 @@ notification lands even if waybar or the terminal is closed. Work ends
 auto-start a break (`AUTO_BREAK=1`); after `CYCLES` work sessions the break is a
 long one. Breaks end back to idle unless `AUTO_WORK=1`.
 
-## Timetable (`pomo sched`)
+## Sessions (`pomo s`)
 
-The day is a list of blocks in `~/.config/pomo/schedule.conf`. A systemd timer
-(`pomo-sched.timer`) ticks every 30 seconds and runs the block that is due, so
-the timer starts itself — nothing to press.
-
-```
-# <days>  <start>  <minutes>  <focus>  <title>
-daily  09:00  165  45  Build app - practice project, no AI
-daily  12:30  165  45  Open source - land a PR
-daily  16:00  165  45  Reverse engineering - one binary
-daily  19:30   45  45  Write and post the X thread about today's RE
-```
-
-`minutes` covers the rests too: three 45-minute sessions with a 15-minute rest
-between them is `165`. Rest length is `BREAK_MIN` in `config.env`.
-
-`days` is `daily`, a range (`mon-fri`), or a list (`mon,wed,fri`). `minutes` is
-how long the whole block runs; `focus` is one session inside it.
-
-What a tick does:
-
-- `PREP_MIN` minutes before a block (10 by default), a heads-up notification
-  names what is coming and when. `PREP_MIN=0` turns it off.
-- At a block's start, a critical notification says what to do, and a task is
-  created for it (title = the block title, `est` = sessions that fit).
-- If the timer is idle, paused, or on some other task while a block is open, it
-  is put back on the block's task. Breaks are left alone.
-- A session runs its full length or not at all: with less than `focus` minutes
-  left in the block, nothing new starts.
-- When a block's window closes, its task is marked done and any session still
-  running is stopped.
+The day is a fixed amount of work in `~/.config/pomo/sessions.conf`, split into
+sessions you start whenever you are ready. There are no days and no start times.
 
 ```
-pomo sched          # today's checklist: [x] done, [>] now, [ ] later
-pomo sched edit     # edit the timetable ($EDITOR)
-pomo sched on|off   # enable/disable the tick timer
+# <minutes>  <focus>  <title>
+165  45  Build app - practice project, no AI
+165  45  Open source - land a PR
+210  45  Reverse engineering + write the X post
 ```
 
-Editing `schedule.conf` takes effect on the next tick; no restart.
+`minutes` covers the rests too: three 45-minute focus sessions with a 15-minute
+rest between them is `165`. Rest length is `BREAK_MIN` in `config.env`.
+
+Rules:
+
+- `pomo s start` takes the next session that is not finished; `pomo s start 3`
+  takes that one. Only one session runs at a time.
+- A session with no tasks gets one from its own title, with `est` set to the
+  number of focus sessions its budget is worth. Add more with `pomo s add`.
+- **A session is finished when every task in it is ticked** — by `pomo done`,
+  `pomo s done`, `Super+Alt+D`, or the menu. Ticking the last one closes the
+  session, stops the timer, and says how many are left today.
+- `minutes` is a budget, not a cutoff. Nothing stops when it runs out: the
+  waybar module turns amber and one notification says so.
+- `pomo s stop` halts a session and keeps its progress; `pomo s skip` writes one
+  off on purpose.
+- At midnight the day rolls: unfinished sessions are recorded as missed, the
+  day's score goes into `log.jsonl`, and the streak — consecutive days where
+  every session was finished — is updated. Tasks do not carry over.
+
+```
+pomo                # today's checklist: [x] done, [>] running, [~] halted, [ ] not started
+pomo s edit         # edit sessions.conf ($EDITOR)
+pomo s on|off       # enable/disable pomo-tick.timer
+pomo streak         # streak, best, and the last 14 days
+```
+
+Editing `sessions.conf` takes effect immediately; no restart.
+
+### Migrating from the timetable
+
+The first run after upgrading converts `schedule.conf` into `sessions.conf`:
+each block loses its `days` and `start`, and any block past the third is folded
+into the third so the day keeps exactly the same total minutes. The old file is
+kept as `schedule.conf.bak`.
 
 ## Phone (ntfy)
 
-Urgent alerts — block start, focus done, task due, the daily summary — are also
-pushed to `ntfy.sh` so they reach a phone. Set `NTFY_TOPIC` in `config.env` and
+Urgent alerts — a session finishing, focus done, a session over its budget, a
+task due, the daily summary — are also pushed to `ntfy.sh` so they reach a phone. Set `NTFY_TOPIC` in `config.env` and
 subscribe to that same topic in the ntfy app (Android, iOS, or the web).
 
 The topic name is the only secret: anyone who knows it can read the pushes, so
@@ -136,28 +153,14 @@ keep it long and random and do not share it.
   disable).
 - `pomo push test` sends a test message.
 
-## Calendar
-
-The timetable also exports as an iCalendar file, so a phone's calendar app can
-show the day without ntfy.
-
-- `pomo sched ics [path]` — write the `.ics` (default
-  `~/.local/share/pomo/timetable.ics`) and import it by hand.
-- `pomo sched gcal` — upload that file to a secret gist and print a URL. Add it
-  in Google Calendar under *Other calendars → From URL*. Re-run it after
-  editing `schedule.conf`; the gist keeps the same URL, and Google re-reads it
-  on its own schedule (hours, not seconds).
-
-Events are weekly-recurring with two alarms: one at the start, one `PREP_MIN`
-minutes before. Each one carries the machine's own timezone as a `TZID`, so the
-blocks land at the hour you wrote no matter where the calendar is read.
-
 ## Reminders
 
 - `pomo-nag.timer` every 10 min: notifies about tasks past their due time, and
-  nudges when the timer is idle but tasks are pending (`NAG_MIN=0` disables the
-  nudge).
-- `pomo-daily.timer` at 18:30: pomodoro count, focus minutes, tasks left.
-- `pomo-sched.timer` every 30 s: runs the timetable (see above).
+  nudges when nothing is running and sessions are still open (`NAG_MIN=0`
+  disables the nudge).
+- `pomo-daily.timer` at 18:30: sessions done, focus minutes, streak.
+- `pomo-tick.timer` every 30 s: rolls the day at midnight, pushes the morning
+  agenda (`AGENDA_AT`), and warns once when a session passes its budget. It
+  never starts a session for you.
 
 Change durations, sounds, and auto-advance in `~/.config/pomo/config.env`.

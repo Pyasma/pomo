@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the pomo timetable every 30 seconds
+Description=Roll the pomo day and watch the session budget, every 30 seconds
 
 [Timer]
 OnCalendar=*:*:0,30

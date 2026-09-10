@@ -6,5 +6,19 @@
     "format": "{}",
     "on-click": "$HOME/.local/bin/pomo toggle",
     "on-click-right": "$HOME/.local/bin/pomo menu",
-    "on-click-middle": "$HOME/.local/bin/pomo stop"
+    "on-click-middle": "$HOME/.local/bin/pomo s stop"
   },
+
+// Classes the module sets, for style.css:
+//
+//   #custom-pomodoro.idle      nothing running, sessions left today
+//   #custom-pomodoro.ready     a session is open, its timer is off
+//   #custom-pomodoro.work      focus running
+//   #custom-pomodoro.break     short break
+//   #custom-pomodoro.long      long break
+//   #custom-pomodoro.paused    timer paused
+//   #custom-pomodoro.over      the session is past its minute budget
+//   #custom-pomodoro.alldone   every session ticked today
+//
+// #custom-pomodoro.over    { color: #e5c07b; }
+// #custom-pomodoro.alldone { color: #98c379; }

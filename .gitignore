@@ -1,3 +1,4 @@
 config.env
-schedule.conf
+sessions.conf
+schedule.conf.bak
 *.ics

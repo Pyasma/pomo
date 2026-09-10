@@ -1,6 +1,0 @@
-[Unit]
-Description=pomo timetable tick
-
-[Service]
-Type=oneshot
-ExecStart=%h/.local/bin/pomo sched tick

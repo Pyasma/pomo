@@ -1,0 +1,20 @@
+# pomo sessions. One session per line, in the order you do them:
+#
+#   <minutes>  <focus>  <title>
+#
+#   minutes  what the session is worth: focus + breaks, your daily budget
+#   focus    length of each focus session inside it
+#   title    what the session is for
+#
+# No days, no start times. Start a session whenever you are ready:
+#
+#   pomo s start        the next unfinished one
+#   pomo s start 3      that one
+#
+# A session finishes when every task in it is ticked, not when its minutes run
+# out. The minutes only drive the progress bar and the over-budget warning.
+# Edits apply immediately, no restart needed.
+
+165      45     Build app - practice project, no AI
+165      45     Open source - land a PR
+210      45     Reverse engineering + write the X post

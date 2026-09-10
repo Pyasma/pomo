@@ -14,24 +14,23 @@ done
 mkdir -p "$BIN" "$CONF" "$UNITS"
 install -m 755 "$SRC/pomo" "$BIN/pomo"
 [[ -f $CONF/config.env ]]    || cp "$SRC/config.env.example" "$CONF/config.env"
-[[ -f $CONF/schedule.conf ]] || cp "$SRC/schedule.conf.example" "$CONF/schedule.conf"
+[[ -f $CONF/sessions.conf ]] || cp "$SRC/sessions.conf.example" "$CONF/sessions.conf"
 cp "$SRC/docs/README.md" "$CONF/README.md"
 install -m 644 "$SRC"/systemd/pomo-*.{service,timer} "$UNITS/"
 
 systemctl --user daemon-reload
-systemctl --user enable --now pomo-nag.timer pomo-daily.timer pomo-sched.timer
+systemctl --user enable --now pomo-nag.timer pomo-daily.timer pomo-tick.timer
 
 cat <<'DONE'
 
 pomo installed.
 
-  pomo sched          today's timetable
-  pomo sched edit     change it
-  pomo ls             tasks
+  pomo                today's three sessions
+  pomo s start        start the next one
+  pomo s edit         change what the sessions are
 
 Optional:
   - waybar module: docs/waybar-module.jsonc
   - hyprland binds: docs/hyprland-binds.conf
   - phone push:     set NTFY_TOPIC in ~/.config/pomo/config.env
-  - calendar:       pomo sched ics, then import the file
 DONE
