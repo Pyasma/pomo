@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=pomo
+GenericName=Pomodoro timer
+Comment=A task, a timer, and one line in the waybar
+Exec=omarchy-launch-or-focus-tui pomo tui
+Icon=pomo
+Terminal=false
+Categories=Utility;Office;ProjectManagement;
+Keywords=pomodoro;timer;focus;tasks;
+StartupWMClass=org.omarchy.pomo

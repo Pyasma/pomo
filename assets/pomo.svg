@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="pomo">
+  <title>pomo</title>
+
+  <!-- stem and leaves, drawn first so the body overlaps their base -->
+  <g fill="#5B9E4A">
+    <path d="M32 6c1.6 0 2.6 1.4 2.4 3.2l-.7 5.6h-3.4l-.7-5.6C29.4 7.4 30.4 6 32 6z"/>
+    <path d="M31 13.5c-3.2-4.2-8.4-5.6-13-4.3-1 .3-1.3 1.4-.6 2.1 3.3 3.4 8.6 5 13 3.6z"/>
+    <path d="M33 13.5c3.2-4.2 8.4-5.6 13-4.3 1 .3 1.3 1.4.6 2.1-3.3 3.4-8.6 5-13 3.6z"/>
+  </g>
+
+  <!-- tomato body -->
+  <circle cx="32" cy="38" r="23" fill="#E2503C"/>
+  <path d="M32 15a23 23 0 0 1 21.6 15.2A23 23 0 0 0 32 61a23 23 0 0 0-21.6-30.8A23 23 0 0 1 32 15z"
+        fill="#FFFFFF" opacity=".10"/>
+
+  <!-- clock face: no tick marks, so it still reads at 16px -->
+  <circle cx="32" cy="38" r="16" fill="#FFF1E4"/>
+
+  <!-- hands at ten past ten -->
+  <g stroke="#2E2119" stroke-linecap="round" fill="none">
+    <path d="M32 38 23.5 31.5" stroke-width="4.2"/>
+    <path d="M32 38 40.5 30" stroke-width="3.4"/>
+  </g>
+</svg>

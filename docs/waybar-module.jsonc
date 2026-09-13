@@ -4,21 +4,37 @@
     "interval": 1,
     "signal": 11,
     "format": "{}",
-    "on-click": "$HOME/.local/bin/pomo toggle",
-    "on-click-right": "$HOME/.local/bin/pomo menu",
-    "on-click-middle": "$HOME/.local/bin/pomo s stop"
+    "on-click": "omarchy-launch-or-focus-tui $HOME/.local/bin/pomo tui",
+    "on-click-right": "$HOME/.local/bin/pomo toggle",
+    "on-click-middle": "$HOME/.local/bin/pomo stop"
   },
 
+// One glyph wide, the same weight as every other module on the bar: a clock
+// whose hand sweeps clockwise as the phase runs out, filled while a timer is
+// running and outline when it is not. The minutes, the task and today's totals
+// are in the tooltip; set BAR_TIME=1 in config.env to print the minutes too.
+//
+// Left-click opens the panel: a small floating terminal with the task list.
+// Right-click starts or pauses the timer without opening anything.
+//
 // Classes the module sets, for style.css:
 //
-//   #custom-pomodoro.idle      nothing running, sessions left today
-//   #custom-pomodoro.ready     a session is open, its timer is off
+//   #custom-pomodoro.idle      nothing running, no task picked
+//   #custom-pomodoro.ready     a task is current, its timer is off
 //   #custom-pomodoro.work      focus running
 //   #custom-pomodoro.break     short break
 //   #custom-pomodoro.long      long break
 //   #custom-pomodoro.paused    timer paused
-//   #custom-pomodoro.over      the session is past its minute budget
-//   #custom-pomodoro.alldone   every session ticked today
+//   #custom-pomodoro.over      the session is past its minute budget (SESSIONS=1)
+//   #custom-pomodoro.alldone   every session ticked today (SESSIONS=1)
 //
 // #custom-pomodoro.over    { color: #e5c07b; }
 // #custom-pomodoro.alldone { color: #98c379; }
+//
+// The clock glyph carries more whitespace inside its em box than the tray
+// icons do, so give it a larger font-size or it reads as the small one:
+//
+// #custom-pomodoro { font-size: 16px; min-width: 16px; margin: 0 8px; }
+//
+// Put the module after group/tray-expander in modules-right so it joins the
+// icon cluster instead of sitting on its own outside the expander.

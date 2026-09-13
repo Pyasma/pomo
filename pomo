@@ -4,7 +4,7 @@
 
 set -uo pipefail
 
-SELF="$HOME/.local/bin/pomo"
+SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) || SELF="$HOME/.local/bin/pomo"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/pomo"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pomo"
 CONF="$CONF_DIR/config.env"
@@ -29,6 +29,9 @@ NTFY_SERVER=https://ntfy.sh
 NTFY_TOPIC=
 PUSH_ALL=0
 AGENDA_AT=08:00
+GOAL=4
+BAR_TIME=${BAR_TIME:-0}
+SESSIONS=${SESSIONS:-0}
 SOUND_END=/usr/share/sounds/freedesktop/stereo/complete.oga
 SOUND_START=/usr/share/sounds/freedesktop/stereo/message.oga
 SOUND_DUE=/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga
@@ -51,6 +54,9 @@ NTFY_SERVER=https://ntfy.sh
 NTFY_TOPIC=       # ntfy topic to mirror alerts to your phone (empty = off)
 PUSH_ALL=0        # 1 = push every notification, not just the urgent ones
 AGENDA_AT=08:00   # time of the "here is today" push (empty disables)
+GOAL=4            # pomodoros that make a day count (0 disables the goal)
+BAR_TIME=0        # 1 = also print the minutes left next to the waybar clock
+#SESSIONS=1       # 1 = enable the predefined daily session plan
 SOUND_END=/usr/share/sounds/freedesktop/stereo/complete.oga
 SOUND_START=/usr/share/sounds/freedesktop/stereo/message.oga
 SOUND_DUE=/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga
@@ -89,7 +95,13 @@ tset() {
 
 sget() { jq -r "$1" "$STATE"; }
 
-refresh_bar() { pkill -RTMIN+"$WAYBAR_SIGNAL" waybar 2>/dev/null; true; }
+# Whatever bar is up gets told: waybar by signal, the Omarchy shell plugin
+# over IPC. Either may be absent; neither may hold the timer up.
+refresh_bar() {
+  pkill -RTMIN+"$WAYBAR_SIGNAL" waybar 2>/dev/null
+  command -v omarchy-shell >/dev/null && omarchy-shell -q pomo refresh >/dev/null 2>&1
+  true
+}
 
 play() {
   local f=$1
@@ -124,6 +136,41 @@ notify() { # title body [urgency] [sound]
   true
 }
 
+today_count() { jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")]|length' "$LOG"; }
+today_minutes() { jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")|.minutes]|add // 0' "$LOG"; }
+
+# Sessions are opt-in. Everything schedule-driven routes through here so the
+# feature can be switched back on without rewiring anything.
+sessions_on() {
+  ((SESSIONS)) && return 0
+  echo "sessions are off — set SESSIONS=1 in $CONF to use them" >&2
+  return 1
+}
+
+# The waybar module is one glyph wide, like every other module on the bar: a
+# clock whose hand sweeps clockwise as the phase runs out. Filled while a timer
+# is running, outline when it is not. Index 0 is twelve o'clock, then one..eleven.
+CLOCK_FILLED=(󱑊 󱐿 󱑀 󱑁 󱑂 󱑃 󱑄 󱑅 󱑆 󱑇 󱑈 󱑉)
+CLOCK_OUTLINE=(󱑖 󱑋 󱑌 󱑍 󱑎 󱑏 󱑐 󱑑 󱑒 󱑓 󱑔 󱑕)
+
+clock_face() { # elapsed total [outline]
+  local e=$1 t=$2 i=0
+  ((t > 0)) && i=$((e * 12 / t))
+  ((i < 0)) && i=0
+  ((i > 11)) && i=11
+  if [[ ${3:-} == outline ]]; then
+    printf '%s' "${CLOCK_OUTLINE[i]}"
+  else
+    printf '%s' "${CLOCK_FILLED[i]}"
+  fi
+}
+
+bar_clock() { # seconds -> "45", or "0:42" inside the final minute
+  local s=$1
+  ((s < 0)) && s=0
+  if ((s < 60)); then printf '0:%02d' "$s"; else printf '%d' $(((s + 59) / 60)); fi
+}
+
 fmt_clock() { # seconds -> M:SS
   local s=$1
   ((s < 0)) && s=0
@@ -147,6 +194,60 @@ phase_label() {
   paused) echo "Paused" ;;
   *) echo "Idle" ;;
   esac
+}
+
+# --- streak -----------------------------------------------------------------
+#
+# Two numbers, both derived from log.jsonl rather than stored: today's count
+# against GOAL, and how many days in a row have cleared it. Nothing to roll
+# over at midnight and nothing to corrupt.
+
+# Days that cleared the goal, counting back from today. Today not counting yet
+# does not break the run: yesterday is where the streak is anchored.
+streak_days() {
+  ((GOAL == 0)) && {
+    echo 0
+    return 0
+  }
+  jq -rs --argjson goal "$GOAL" --arg today "$(date +%F)" '
+    ([.[] | select(.phase=="work") | .date] | group_by(.) | map({(.[0]): length}) | add // {}) as $by
+    | [range(0; 400)] | reduce .[] as $i ({n: 0, stop: false};
+        if .stop then .
+        else
+          ($today | strptime("%Y-%m-%d") | mktime - ($i * 86400) | strftime("%Y-%m-%d")) as $d
+          | (($by[$d] // 0) >= $goal) as $hit
+          | if $hit then .n += 1
+            elif $i == 0 then .          # today is still open, keep looking back
+            else .stop = true end
+        end)
+    | .n' "$LOG"
+}
+
+# The fire. One flame at a day, two from three, three from seven, and the
+# colour climbs from ember to white-hot with the run. Prints glyphs<TAB>colour,
+# the colour a 256-colour code for the panel; the bar wants only the glyphs.
+streak_fire() { # days
+  local n=$1 glyph="󰈸" flames colour
+  if ((n <= 0)); then
+    printf '\t240\n'
+  elif ((n < 3)); then
+    printf '%s\t208\n' "$glyph"
+  elif ((n < 7)); then
+    printf '%s%s\t214\n' "$glyph" "$glyph"
+  elif ((n < 14)); then
+    printf '%s%s%s\t220\n' "$glyph" "$glyph" "$glyph"
+  else
+    printf '%s%s%s\t231\n' "$glyph" "$glyph" "$glyph"
+  fi
+}
+
+# "󰈸󰈸 5 day streak", coloured, for one-line use.
+streak_text() {
+  local n glyphs colour
+  n=$(streak_days)
+  IFS=$'\t' read -r glyphs colour < <(streak_fire "$n")
+  ((n > 0)) || return 0
+  printf '\e[38;5;%sm%s %s day streak\e[0m' "$colour" "$glyphs" "$n"
 }
 
 # --- alarm scheduling -------------------------------------------------------
@@ -229,9 +330,13 @@ parse_due() { # human time -> epoch or empty
 }
 
 cmd_add() {
-  local title="" est=1 due="" wmin=null
+  local title="" est=1 due="" wmin=null quiet=0
   while (($#)); do
     case "$1" in
+    -q | --quiet)
+      quiet=1
+      shift
+      ;;
     -e | --est)
       est=$2
       shift 2
@@ -270,8 +375,20 @@ cmd_add() {
     --argjson due "$due_epoch" --argjson now "$(now)" \
     --argjson wmin "$wmin" \
     '. + [{id:$id,title:$title,est:$est,done:0,status:"active",created:$now,due:$due,wmin:$wmin}]'
-  echo "added #$id  $title"
+  if ((quiet)); then echo "$id"; else echo "added #$id  $title"; fi
   refresh_bar
+}
+
+cmd_new() { # title [-m MIN] — add a task, make it current, start the timer
+  local id
+  [[ -z ${1//[[:space:]]/} ]] && {
+    echo "usage: pomo new <title> [-m MIN]" >&2
+    return 1
+  }
+  id=$(cmd_add -q "$@") || return 1
+  [[ -z $id ]] && return 1
+  jset --argjson id "$id" '.task=$id'
+  cmd_start "$id"
 }
 
 cmd_ls() {
@@ -293,6 +410,17 @@ cmd_ls() {
       end' "$TASKS"
 }
 
+# A timer belongs to its task. Finish or delete that task and the clock stops
+# and resets, rather than counting down for something that is no longer there.
+clear_timer_for() { # id
+  [[ $(sget '.task') == "$1" ]] || return 0
+  if [[ $(sget '.phase') != idle ]]; then
+    cancel_alarm
+    jset '.phase="idle" | .ends_at=0 | .left=0 | .elapsed=0'
+  fi
+  jset '.task=null'
+}
+
 cmd_done() {
   local id=${1:-}
   if [[ -n ${id//[[:space:]]/} ]]; then
@@ -307,7 +435,7 @@ cmd_done() {
   local title
   title=$(task_title "$id")
   tset --argjson id "$id" 'map(if .id==$id then .status="done" else . end)'
-  [[ $(sget '.task') == "$id" ]] && jset '.task=null'
+  clear_timer_for "$id"
   echo "done #$id  $title"
   refresh_bar
   sess_after_done "$id"
@@ -320,7 +448,7 @@ cmd_rm() {
     return 1
   }
   tset --argjson id "$id" 'map(select(.id!=$id))'
-  [[ $(sget '.task') == "$id" ]] && jset '.task=null'
+  clear_timer_for "$id"
   echo "removed #$id"
   refresh_bar
 }
@@ -435,7 +563,12 @@ cmd_pause() {
   left=$(($(sget '.ends_at') - $(now)))
   ((left < 0)) && left=0
   cancel_alarm
-  jset --arg prev "$phase" --argjson left "$left" '.prev=$prev | .phase="paused" | .left=$left'
+  # Remember how much of the phase is already spent: resume rebases .started
+  # on it, otherwise ends_at - started grows by the whole pause and the phase
+  # logs hours it never ran.
+  jset --arg prev "$phase" --argjson left "$left" \
+    --argjson elapsed "$(($(now) - $(sget '.started')))" \
+    '.prev=$prev | .phase="paused" | .left=$left | .elapsed=$elapsed'
   refresh_bar
   echo "paused with $(fmt_clock "$left") left"
 }
@@ -445,7 +578,12 @@ cmd_resume() {
   prev=$(sget '.prev // "work"')
   left=$(sget '.left')
   ((left <= 0)) && left=$(phase_seconds "$prev")
-  jset --arg p "$prev" --argjson ends "$(($(now) + left))" '.phase=$p | .ends_at=$ends | .left=0'
+  local elapsed
+  elapsed=$(jq -r '.elapsed // 0' "$STATE")
+  ((elapsed < 0)) && elapsed=0
+  jset --arg p "$prev" --argjson ends "$(($(now) + left))" \
+    --argjson started "$(($(now) - elapsed))" \
+    '.phase=$p | .ends_at=$ends | .left=0 | .started=$started | .elapsed=0'
   schedule_alarm "$left"
   refresh_bar
   echo "resumed, $(fmt_clock "$left") left"
@@ -453,7 +591,7 @@ cmd_resume() {
 
 cmd_toggle() {
   case "$(sget '.phase')" in
-  idle) cmd_sess_start ;;
+  idle) if ((SESSIONS)); then cmd_sess_start; else cmd_start; fi ;;
   paused) cmd_resume ;;
   *) cmd_pause ;;
   esac
@@ -477,6 +615,16 @@ cmd_skip() {
   esac
 }
 
+# Minutes the phase about to end actually ran. Capped so a phase whose alarm
+# never fired cannot dump a day's worth of minutes into the totals.
+phase_minutes() {
+  local secs
+  secs=$(($(sget '.ends_at') - $(sget '.started')))
+  ((secs < 0)) && secs=0
+  ((secs > 86400)) && secs=86400
+  echo $((secs / 60))
+}
+
 log_session() { # phase minutes task_id
   local phase=$1 mins=$2 id=$3
   jq -nc --arg phase "$phase" --argjson mins "$mins" --argjson id "${id:-null}" \
@@ -491,7 +639,7 @@ finish_work() { # [skipped]
   mins=$(((($(now) - $(sget '.started')) + 30) / 60))
   ((mins < 0)) && mins=0
   if [[ ${1:-} != skipped ]]; then
-    mins=$((($(sget '.ends_at') - $(sget '.started')) / 60))
+    mins=$(phase_minutes)
     [[ $id != null ]] && tset --argjson id "$id" 'map(if .id==$id then .done=(.done+1) else . end)'
   fi
   log_session work "$mins" "$id"
@@ -510,6 +658,20 @@ finish_work() { # [skipped]
   body=$(printf '%s' "$title")
   [[ -n $title && -n $prog ]] && body=$(printf '%s\n%s' "$title" "$prog")
   [[ -z $title ]] && body=$prog
+  # What that pomodoro just bought, said at the only moment it lands.
+  local earned=""
+  if [[ ${1:-} != skipped ]] && ((GOAL > 0)); then
+    local have streak glyphs
+    have=$(today_count)
+    if ((have == GOAL)); then
+      streak=$(streak_days)
+      IFS=$'\t' read -r glyphs _ < <(streak_fire "$streak")
+      earned="goal cleared · $have/$GOAL · $glyphs $streak day streak"
+    else
+      earned="$have/$GOAL today"
+    fi
+    body="${body:+$body$'\n'}$earned"
+  fi
   if ((AUTO_BREAK)); then
     notify "󰄬  ${sprog:-Focus done} — $(phase_label "$next_phase") $((($(phase_seconds "$next_phase")) / 60))m" \
       "$body" critical "$SOUND_END"
@@ -521,7 +683,7 @@ finish_work() { # [skipped]
 }
 
 finish_break() {
-  log_session "$(sget '.phase')" "$((($(sget '.ends_at') - $(sget '.started')) / 60))" "$(sget '.task')"
+  log_session "$(sget '.phase')" "$(phase_minutes)" "$(sget '.task')"
   local id title="" sn tag="Break over"
   id=$(sget '.task')
   [[ $id != null ]] && title=$(task_title "$id")
@@ -551,7 +713,7 @@ cmd_fire() {
 # task inside it is ticked, not when a clock says so. The timetable only fixes
 # how much work a session is worth, never when it has to happen.
 
-SESSIONS="$CONF_DIR/sessions.conf"
+SESS_CONF="$CONF_DIR/sessions.conf"
 SESS_STATE="$DATA/sessions.json"
 LEGACY_SCHED="$CONF_DIR/schedule.conf"
 
@@ -599,7 +761,7 @@ sess_migrate() {
   {
     sess_header
     for ((i = 0; i < n; i++)); do printf '%-8s %-6s %s\n' "${bm[i]}" "${bf[i]}" "${bt[i]}"; done
-  } >"$SESSIONS"
+  } >"$SESS_CONF"
   mv "$LEGACY_SCHED" "$LEGACY_SCHED.bak"
   echo "pomo: migrated schedule.conf -> sessions.conf (old file kept as schedule.conf.bak)" >&2
   return 0
@@ -607,15 +769,15 @@ sess_migrate() {
 
 sess_init() {
   [[ -f $SESS_STATE ]] || echo '{"date":"","streak":0,"best":0,"announced":{},"sessions":[]}' >"$SESS_STATE"
-  [[ -f $SESSIONS ]] && return 0
+  [[ -f $SESS_CONF ]] && return 0
   sess_migrate && return 0
   {
     sess_header
     printf '%-8s %-6s %s\n' 165 45 "Build app - practice project, no AI"
     printf '%-8s %-6s %s\n' 165 45 "Open source - land a PR"
     printf '%-8s %-6s %s\n' 210 45 "Reverse engineering + write the X post"
-  } >"$SESSIONS"
-  echo "created $SESSIONS"
+  } >"$SESS_CONF"
+  echo "created $SESS_CONF"
 }
 
 # The plan for a day: n<TAB>minutes<TAB>focus<TAB>title
@@ -628,7 +790,7 @@ sess_plan() {
     is_num "$mins" && is_num "$focus" || continue
     n=$((n + 1))
     printf '%s\t%s\t%s\t%s\n' "$n" "$mins" "$focus" "$rest"
-  done <"$SESSIONS"
+  done <"$SESS_CONF"
 }
 
 sset() {
@@ -680,6 +842,7 @@ sess_sync() {
 
 # New day: credit yesterday, move the streak, rebuild today from the plan.
 sess_roll() {
+  ((SESSIONS)) || return 0
   sess_init
   local today stored
   today=$(date +%F)
@@ -722,7 +885,10 @@ sess_roll() {
 }
 
 # The session a task belongs to, or empty.
-sess_of_task() { jq -r --argjson id "$1" '[.sessions[]|select(.tasks|index($id))|.n]|first // empty' "$SESS_STATE"; }
+sess_of_task() {
+  ((SESSIONS)) || return 0
+  jq -r --argjson id "$1" '[.sessions[]|select(.tasks|index($id))|.n]|first // empty' "$SESS_STATE"
+}
 
 sess_open_tasks() { # n -> ids of its still-active tasks
   local ids id
@@ -812,7 +978,9 @@ sess_after_done() { # task_id
   dn=$(sess_done_count)
   if ((dn >= total)); then
     streak=$(($(jq -r '.streak // 0' "$SESS_STATE") + 1))
-    notify "󰄬  $dn/$total today" "Whole day cleared · streak $((streak))d" critical "$SOUND_END"
+    local glyphs
+    IFS=$'\t' read -r glyphs _ < <(streak_fire "$streak")
+    notify "󰄬  $dn/$total today" "Whole day cleared · $glyphs streak ${streak}d" critical "$SOUND_END"
   else
     notify "󰄬  Session $n done" "$((total - dn)) session(s) left today" critical "$SOUND_END"
   fi
@@ -984,11 +1152,14 @@ cmd_session() {
 }
 
 cmd_streak() {
+  sessions_on || return 1
   sess_roll
   local streak best
   streak=$(jq -r '.streak' "$SESS_STATE")
   best=$(jq -r '.best' "$SESS_STATE")
-  printf 'streak %sd   best %sd   today %s/%s\n\n' "$streak" "$best" "$(sess_done_count)" "$(sess_count)"
+  local glyphs colour
+  IFS=$'\t' read -r glyphs colour < <(streak_fire "$streak")
+  printf '\e[38;5;%sm%s\e[0m streak %sd   best %sd   today %s/%s\n\n' "$colour" "$glyphs" "$streak" "$best" "$(sess_done_count)" "$(sess_count)"
   echo "last 14 days:"
   jq -rs --argjson since "$(date -d '14 days ago' +%s)" '
     [.[]|select(.phase=="day" and .t>=$since)]
@@ -999,7 +1170,7 @@ cmd_streak() {
 
 cmd_sess_edit() {
   sess_init
-  "${EDITOR:-nano}" "$SESSIONS"
+  "${EDITOR:-nano}" "$SESS_CONF"
   sess_roll
   cmd_session
 }
@@ -1007,6 +1178,7 @@ cmd_sess_edit() {
 # Fires every 30s from pomo-tick.timer. It never starts anything: the day rolls
 # over here, and the phone gets its two nudges.
 cmd_tick() {
+  ((SESSIONS)) || return 0
   sess_roll
   local n dn total
   dn=$(sess_done_count)
@@ -1064,8 +1236,29 @@ cmd_due_check() {
 cmd_nag() {
   cmd_due_check
   ((NAG_MIN == 0)) && return 0
-  sess_roll
   [[ $(sget '.phase') != idle ]] && return 0
+
+  # The systemd timer fires more often than NAG_MIN on purpose; the interval is
+  # enforced here, against the later of the last phase and the last nudge.
+  local ref quiet
+  ref=$(jq -r '[.started // 0, .nagged // 0] | max' "$STATE")
+  quiet=$((($(now) - ref) / 60))
+  ((ref > 0 && quiet < NAG_MIN)) && return 0
+  jset --argjson t "$(now)" '.nagged=$t'
+
+  if ((SESSIONS)); then
+    cmd_nag_sessions
+  else
+    local open
+    open=$(jq '[.[]|select(.status=="active")]|length' "$TASKS")
+    ((open == 0)) && return 0
+    notify "󰔟  $(today_count) pomodoros today" \
+      "$open task(s) open · Super+Alt+M for the panel" normal "$SOUND_START"
+  fi
+}
+
+cmd_nag_sessions() {
+  sess_roll
   local dn total run nx
   dn=$(sess_done_count)
   total=$(sess_count)
@@ -1084,18 +1277,23 @@ cmd_nag() {
 }
 
 cmd_daily() {
+  ((SESSIONS)) || {
+    notify "󰃰  $(today_minutes)m focus today" "$(today_count) pomodoros" normal
+    return 0
+  }
   sess_roll
   local dn total mins pom
   dn=$(sess_done_count)
   total=$(sess_count)
-  pom=$(jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")]|length' "$LOG")
-  mins=$(jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")|.minutes]|add // 0' "$LOG")
+  pom=$(today_count)
+  mins=$(today_minutes)
   notify "󰃰  $dn/$total sessions · ${mins}m focus" \
     "$pom pomodoros · streak $(jq -r '.streak' "$SESS_STATE")d" normal
 }
 
 cmd_report() {
-  echo "today: $(jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")]|length' "$LOG") pomodoros, $(jq -s --arg d "$(date +%F)" '[.[]|select(.date==$d and .phase=="work")|.minutes]|add // 0' "$LOG") min focus"
+  echo "today: $(today_count) pomodoros, $(today_minutes) min focus"
+  ((GOAL > 0)) && echo "goal:  $(today_count)/$GOAL   ·   streak $(streak_days) day(s)"
   echo
   echo "per task today:"
   jq -rs --arg d "$(date +%F)" '
@@ -1110,6 +1308,446 @@ cmd_report() {
     | "  \(.[0].date)  \(length) pomodoros  \([.[].minutes]|add)m"' "$LOG"
 }
 
+# --- tui panel --------------------------------------------------------------
+
+# A 3x5 block font, doubled horizontally so the clock reads as a clock and not
+# as a row of text. Only the glyphs a countdown can contain.
+_glyph_rows() { # char -> five 3-char rows on stdout
+  case "$1" in
+  0) printf '%s\n' "███" "█ █" "█ █" "█ █" "███" ;;
+  1) printf '%s\n' "  █" "  █" "  █" "  █" "  █" ;;
+  2) printf '%s\n' "███" "  █" "███" "█  " "███" ;;
+  3) printf '%s\n' "███" "  █" "███" "  █" "███" ;;
+  4) printf '%s\n' "█ █" "█ █" "███" "  █" "  █" ;;
+  5) printf '%s\n' "███" "█  " "███" "  █" "███" ;;
+  6) printf '%s\n' "███" "█  " "███" "█ █" "███" ;;
+  7) printf '%s\n' "███" "  █" "  █" "  █" "  █" ;;
+  8) printf '%s\n' "███" "█ █" "███" "█ █" "███" ;;
+  9) printf '%s\n' "███" "█ █" "███" "  █" "███" ;;
+  :) printf '%s\n' " " "█" " " "█" " " ;;
+  -) printf '%s\n' "   " "   " "███" "   " "   " ;;
+  *) printf '%s\n' "   " "   " "   " "   " "   " ;;
+  esac
+}
+
+big_clock() { # text -> five wide rows, centred in $2 columns
+  # Each cell is repeated horizontally so the digits read as a clock; a wide
+  # panel gets a wider stroke rather than a small clock floating in space.
+  local text=$1 width=${2:-60} r i c pad scale=2 n
+  ((width >= 96)) && scale=3
+  local -a cell
+  local -a rows=("" "" "" "" "")
+  for ((i = 0; i < ${#text}; i++)); do
+    mapfile -t cell < <(_glyph_rows "${text:i:1}")
+    for ((r = 0; r < 5; r++)); do rows[r]+="${cell[r]} "; done
+  done
+  for ((r = 0; r < 5; r++)); do
+    local wide="" line=${rows[r]% }
+    for ((i = 0; i < ${#line}; i++)); do
+      c=${line:i:1}
+      for ((n = 0; n < scale; n++)); do wide+="$c"; done
+    done
+    pad=$(((width - ${#wide}) / 2))
+    ((pad < 0)) && pad=0
+    printf '%*s%s\n' "$pad" "" "$wide"
+  done
+}
+
+_centre() { # text centred in $2 columns; $3 overrides the printable length
+  local text=$1 width=${2:-60} len=${3:-} pad
+  [[ -z $len ]] && len=${#text}
+  pad=$(((width - len) / 2))
+  ((pad < 0)) && pad=0
+  printf '%*s%s' "$pad" "" "$text"
+  [[ -n ${3:-} ]] || printf '\n'
+}
+
+# The head of the panel: the countdown, what it is counting, and today's total.
+# fzf re-runs this once a second while the panel is open (--bind every(1)).
+# With no tasks the list would be a void; this puts one unselectable line in it.
+tui_empty_hint() {
+  [[ -n $(cmd_tui_list) ]] && return 0
+  printf '\t\e[2m  no tasks yet — press ^n, or click the new button below\e[0m\n'
+}
+
+cmd_tui_status() {
+  local width=${FZF_PREVIEW_COLUMNS:-60}
+  local phase task clock colour label
+  phase=$(sget '.phase')
+  task=$(sget '.task')
+  # One colour per phase, carried by the clock and by the word under it.
+  case "$phase" in
+  work)
+    clock=$(fmt_clock $(($(sget '.ends_at') - $(now))))
+    colour=$'\e[38;5;215m'
+    ;;
+  break | long)
+    clock=$(fmt_clock $(($(sget '.ends_at') - $(now))))
+    colour=$'\e[38;5;114m'
+    ;;
+  paused)
+    clock=$(fmt_clock "$(sget '.left')")
+    colour=$'\e[38;5;110m'
+    ;;
+  *)
+    clock="--:--"
+    colour=$'\e[38;5;240m'
+    ;;
+  esac
+  # M:SS from fmt_clock, padded so the glyphs stop shifting sideways each minute
+  [[ $clock == ?:* ]] && clock="0$clock"
+
+  local title="" dots="" plain=""
+  label=$(phase_label "$phase")
+  if [[ $task != null ]] && task_exists "$task"; then
+    title=$(task_title "$task")
+    dots=$(jq -r --argjson id "$task" '
+      def rep($s; $n): if $n > 0 then $s * $n else "" end;
+      .[] | select(.id==$id)
+      | (if .est > 8 then 8 else .est end) as $cap
+      | (if .done > $cap then $cap else .done end) as $on
+      | "\u001b[38;5;114m" + rep("●"; $on) + "\u001b[38;5;240m" + rep("○"; $cap - $on)
+        + "\u001b[0m\u001b[2m   \(.done) of \(.est)\u001b[0m"
+        + "|" + rep("●"; $on) + rep("○"; $cap - $on) + "   \(.done) of \(.est)"' "$TASKS")
+  fi
+  [[ $phase == idle && $task == null ]] && label="nothing running"
+  plain=$label
+  [[ -n $title ]] && plain+=" · $title"
+
+  big_clock "$clock" "$width" | while IFS= read -r line; do
+    printf '%s%s\e[0m\n' "$colour" "$line"
+  done
+  echo
+  # _centre pads on the printable text, so each line is measured without its
+  # escapes and coloured afterwards.
+  local pad
+  pad=$(_centre "" "$width" "${#plain}")
+  if [[ -n $title ]]; then
+    printf '%s%s%s\e[0m \e[2m·\e[0m \e[1m%s\e[0m\n' "$pad" "$colour" "$label" "$title"
+  else
+    printf '%s%s%s\e[0m\n' "$pad" "$colour" "$label"
+  fi
+  if [[ -n $dots ]]; then
+    local shown=${dots%%|*} bare=${dots##*|}
+    printf '%s%s\n' "$(_centre "" "$width" "${#bare}")" "$shown"
+  fi
+  local totals="$(today_count) pomodoros today · $(today_minutes)m focus"
+  printf '%s\e[2m%s\e[0m\n' "$(_centre "" "$width" "${#totals}")" "$totals"
+  tui_streak_lines "$width"
+}
+
+# The goal bar and the fire beside it.
+tui_streak_lines() {
+  local width=$1 have streak bar rest plain i glyphs colour
+  ((GOAL > 0)) || return 0
+  have=$(today_count)
+  streak=$(streak_days)
+  IFS=$'\t' read -r glyphs colour < <(streak_fire "$streak")
+  local filled=$have
+  ((filled > GOAL)) && filled=$GOAL
+  bar="" rest=""
+  for ((i = 0; i < filled; i++)); do bar+="▰"; done
+  for ((i = filled; i < GOAL; i++)); do rest+="▱"; done
+  plain="$bar$rest  $have of $GOAL today"
+  ((streak > 0)) && plain+="   ·   $glyphs $streak day streak"
+  local shade=$'\e[38;5;215m'
+  ((have >= GOAL)) && shade=$'\e[38;5;114m'
+  printf '%s%s%s\e[38;5;240m%s\e[0m\e[2m  %s of %s today\e[0m' \
+    "$(_centre "" "$width" "${#plain}")" "$shade" "$bar" "$rest" "$have" "$GOAL"
+  ((streak > 0)) && printf '\e[2m   ·   \e[0m\e[38;5;%sm%s %s\e[0m\e[2m day streak\e[0m' "$colour" "$glyphs" "$streak"
+  printf '\n'
+}
+
+# One row per task: the id in field 1, the display in field 2. fzf hides field 1
+# (--with-nth=2..) and hands it back as {1}, so no bind ever parses an id out of
+# text a title could imitate.
+cmd_tui_list() {
+  jq -r --argjson cur "$(jq -r '.task' "$STATE")" --argjson now "$(now)" '
+    def rep($s; $n): if $n > 0 then $s * $n else "" end;
+    def fit($n): if (length > $n) then (.[0:$n-1] + "…") else . + rep(" "; $n - length) end;
+    def dots($d; $e):
+      ($e | if . > 6 then 6 else . end) as $cap
+      | ($d | if . > $cap then $cap else . end) as $on
+      | "\u001b[38;5;114m" + rep("●"; $on)
+        + "\u001b[38;5;240m" + rep("○"; $cap - $on) + "\u001b[0m"
+        + rep(" "; 6 - $cap);
+
+    map(select(.status=="active"))
+    | sort_by(.due // 9999999999, .created)
+    | .[] | [ (.id|tostring),
+        (if .id==$cur then "\u001b[38;5;215m▸\u001b[0m " else "  " end)
+        + (if .id==$cur then "\u001b[1m" else "" end)
+        + (.title | fit(32)) + "\u001b[0m"
+        + "   " + dots(.done; .est)
+        + "  " + (if .wmin then "\u001b[38;5;110m\(.wmin)m\u001b[0m" + rep(" "; 4 - ("\(.wmin)m"|length)) else "     " end)
+        + (if .due then (if .due < $now then "  \u001b[38;5;210m" else "  \u001b[2m" end)
+             + "due " + (.due|strflocaltime("%a %H:%M")) + "\u001b[0m" else "" end)
+      ] | @tsv' "$TASKS"
+}
+
+# A short list you can also type into: the picker returns whatever number came
+# back, whether it was chosen or typed.
+tui_pick_number() { # label prompt default rest_of_the_options...
+  local label=$1 prompt=$2 default=$3
+  shift 3
+  local out picked rc
+  out=$(printf '%s\n' "$default" "$@" | awk '!seen[$0]++' |
+    fzf --print-query --layout=reverse --info=hidden --height=100% \
+      --border=rounded --border-label=" $label " --border-label-pos=3 \
+      --padding=1,2 --prompt="$prompt" --pointer='▌' \
+      --footer="$(tui_back_hint)" --footer-border=top \
+      --color='fg:250,bg:235,fg+:255,bg+:238,hl:215,hl+:215,gutter:235' \
+      --color='border:240,label:215,prompt:215,pointer:215,query:255,footer:240')
+  rc=$?
+  # 130 is esc: the way back. Say so with the same code, so a caller in the
+  # middle of a multi-step flow can drop the whole flow instead of pressing on
+  # with a default the user never chose.
+  ((rc == 130)) && return 130
+  # Line 1 is what was typed, line 2 what was highlighted. Typing wins, or "4"
+  # would silently become the 45 it filtered down to.
+  picked=$(sed -n 1p <<<"$out")
+  [[ -z ${picked//[[:space:]]/} ]] && picked=$(sed -n 2p <<<"$out")
+  picked=${picked//[^0-9]/}
+  [[ -z $picked ]] && return 1
+  ((picked < 1 || picked > 600)) && return 1
+  printf '%s' "$picked"
+}
+
+# Free text, in the same frame as the pickers — a bare `read` in the terminal
+# showed the terminal's own background and echoed stray escape sequences.
+tui_prompt_text() { # label prompt
+  local out rc
+  out=$(: | fzf --print-query --layout=reverse --info=hidden --height=100% \
+    --border=rounded --border-label=" $1 " --border-label-pos=3 \
+    --padding=1,2 --prompt="$2" --pointer='▌' \
+    --footer="$(tui_back_hint)" --footer-border=top \
+    --color='fg:250,bg:235,fg+:255,bg+:238,hl:215,hl+:215,gutter:235' \
+    --color='border:240,label:215,prompt:215,pointer:215,query:255,footer:240')
+  rc=$?
+  ((rc == 130)) && return 130
+  sed -n 1p <<<"$out"
+}
+
+# One idea, not two: the length you pick becomes the task's length and starts
+# it, so there is no separate "set the default" step to remember.
+cmd_tui_focus() {
+  local id=$1 own mins
+  [[ -z $id ]] && return 0
+  own=$(jq -r --argjson id "$id" '(.[]|select(.id==$id)|.wmin) // empty' "$TASKS")
+  mins=$(tui_pick_number "length · $(task_title "$id")" 'minutes › ' \
+    "${own:-$WORK_MIN}" 25 30 45 50 60 90) || return 0
+  cmd_len "$id" "$mins" >/dev/null
+  cmd_use "$id" >/dev/null
+  cmd_start "$id"
+  panel_signal close
+}
+
+# Same for a rest, which until now could only ever be BREAK_MIN.
+cmd_tui_rest() {
+  local mins
+  mins=$(tui_pick_number rest 'minutes › ' "$BREAK_MIN" 5 10 15 20 30 45) || return 0
+  cmd_break -m "$mins"
+  panel_signal close
+}
+
+# Creating a task is its own step now: the search box only ever searches.
+cmd_tui_new() {
+  local title est mins id
+  title=$(tui_prompt_text 'new task' 'what is it? › ') || return 0
+  [[ -z ${title//[[:space:]]/} ]] && return 0
+  est=$(tui_pick_number "pomodoros · $title" 'how many? › ' 1 2 3 4 5 6 8)
+  (($? == 130)) && return 0
+  mins=$(tui_pick_number "focus length · $title" 'minutes › ' "$WORK_MIN" \
+    25 30 45 50 60 90)
+  (($? == 130)) && return 0
+  local -a args=("$title" -e "${est:-1}")
+  [[ -n $mins ]] && args+=(-m "$mins")
+  id=$(cmd_add -q "${args[@]}") || return 0
+  jset --argjson id "$id" '.task=$id'
+}
+
+# Entries are "colour|label". An empty colour means a ghost: dim text, no
+# background, for the keys that did not earn a button.
+tui_button_row() { # width cell_width entry...
+  local width=$1 cell=$2
+  shift 2
+  local -a labels=() colours=() e
+  for e in "$@"; do
+    colours+=("${e%%|*}")
+    labels+=("${e#*|}")
+  done
+  local n=${#labels[@]} pill=$((cell + 2))
+  # Justified: the row spans the full width, the slack shared out between the
+  # buttons, so the row reads as a bar rather than a huddle in the middle.
+  local slack=$((width - n * pill)) gap=0 extra=0
+  if ((n > 1 && slack > 0)); then
+    gap=$((slack / (n - 1)))
+    extra=$((slack % (n - 1)))
+  fi
+  local out="" i l lead trail g
+  for ((i = 0; i < n; i++)); do
+    l=${labels[i]}
+    if ((i > 0)); then
+      g=$gap
+      ((i <= extra)) && g=$((gap + 1))
+      out+=$'\e[0m'
+      printf -v out '%s%*s' "$out" "$g" ""
+    fi
+    # left-aligned inside the cell: centring would give each label a different
+    # leading offset, and the key line below would stop lining up
+    lead=0
+    trail=$((cell - ${#l}))
+    if [[ -n ${colours[i]} ]]; then
+      out+=$'\e[48;5;'"${colours[i]}"$'m\e[38;5;235m\e[1m'
+    else
+      out+=$'\e[2m'
+    fi
+    printf -v l ' %*s%s%*s ' "$lead" "" "$l" "$trail" ""
+    out+="$l"$'\e[0m'
+  done
+  printf '%s' "$out"
+}
+
+panel_signal() { printf '%s' "$1" >"$DATA/.panel"; }
+
+# What fzf should do once a prompt has closed: leave, if the prompt actually
+# started something, otherwise go back to the list.
+tui_after() {
+  local note=""
+  if [[ -f $DATA/.panel ]]; then
+    note=$(cat "$DATA/.panel")
+    rm -f "$DATA/.panel"
+  fi
+  if [[ $note == close ]]; then
+    echo abort
+  else
+    echo "reload($SELF _tuilist)+refresh-preview"
+  fi
+}
+
+# Shown at the foot of every prompt the panel raises, so there is always a
+# visible way back that is not "close the whole thing".
+tui_back_hint() {
+  printf '\e[2m  esc back   ↵ choose\e[0m'
+}
+
+tui_footer() {
+  local width=${1:-70} cell=0 l
+  # Ten buttons, all in the one accent colour: every action is clickable, so
+  # every action looks the same. Start is the same amber, just bolder.
+  local -a row=(
+    "215|↵ start" "215|^p pause" "215|^d done" "215|^n new" "215|^b rest"
+  )
+  local -a keys=(
+    "215|^t length" "215|^x delete" "215|^s stop" "215|esc close"
+  )
+  for l in "${row[@]}" "${keys[@]}"; do
+    l=${l#*|}
+    ((${#l} > cell)) && cell=${#l}
+  done
+  printf '\n'
+  tui_button_row "$width" "$cell" "${row[@]}"
+  printf '\n\n'
+  tui_button_row "$width" "$cell" "${keys[@]}"
+}
+
+# A clicked word (or the key printed beside it) becomes an fzf action string,
+# which fzf's `transform` binding then runs. Actions that leave the panel say so
+# with +abort; the rest reload the list in place.
+tui_click() { # word id
+  local word=$1 id=${2:-}
+  local reload="+reload($SELF _tuilist)+refresh-preview"
+  case "$word" in
+  start | ↵)
+    [[ -z $id ]] && {
+      echo ignore
+      return 0
+    }
+    echo "become($SELF _tuigo $id)"
+    ;;
+  rest | '^b') echo "execute($SELF _tuirest)+transform($SELF _tuiafter)" ;;
+  new | '^n') echo "execute($SELF _tuinew)$reload" ;;
+  done | '^d')
+    [[ -z $id ]] && {
+      echo ignore
+      return 0
+    }
+    echo "execute-silent($SELF done $id)$reload"
+    ;;
+  delete | '^x')
+    [[ -z $id ]] && {
+      echo ignore
+      return 0
+    }
+    echo "execute-silent($SELF rm $id)$reload"
+    ;;
+  length | '^t' | focus)
+    [[ -z $id ]] && {
+      echo ignore
+      return 0
+    }
+    echo "execute($SELF _tuifocus $id)+transform($SELF _tuiafter)"
+    ;;
+  pause | '^p') echo "execute-silent($SELF toggle)+refresh-preview" ;;
+  stop | '^s') echo "execute-silent($SELF stop)+refresh-preview" ;;
+  close | esc) echo abort ;;
+  *) echo ignore ;;
+  esac
+}
+
+# What enter and the start button both do.
+cmd_tui_go() {
+  local id=${1:-}
+  [[ -z $id ]] && return 0
+  cmd_use "$id" >/dev/null
+  cmd_start "$id"
+}
+
+cmd_tui() {
+  command -v fzf >/dev/null || {
+    echo "pomo tui needs fzf" >&2
+    return 1
+  }
+  local out rc id width
+  # a note left behind by a crashed prompt would close the panel on sight
+  rm -f "$DATA/.panel"
+  width=$(tput cols 2>/dev/null || echo 80)
+  width=$((width - 12))
+  ((width < 20)) && width=20
+  out=$( (cmd_tui_list; tui_empty_hint) | fzf \
+    --ansi --delimiter=$'\t' --with-nth=2.. \
+    --layout=reverse --no-sort --cycle --info=hidden \
+    --border=rounded --border-label=' pomo ' --border-label-pos=3 \
+    --padding=1,2 \
+    --prompt='search › ' --pointer='▌' \
+    --color='fg:250,bg:235,fg+:255,bg+:238,hl:215,hl+:215,gutter:235' \
+    --color='preview-fg:250,preview-bg:235,query:255,disabled:240' \
+    --color='border:240,label:215,preview-border:240,footer-border:240' \
+    --color='prompt:215,pointer:215,header:240,footer:240' \
+    --footer="$(tui_footer "$width")" \
+    --footer-border=top \
+    --min-height=20 \
+    --preview="$SELF _tuistatus" --preview-window=up,12,border-bottom \
+    --bind 'every(1):refresh-preview' \
+    --bind "ctrl-d:execute-silent($SELF done {1})+reload($SELF _tuilist)+refresh-preview" \
+    --bind "ctrl-x:execute-silent($SELF rm {1})+reload($SELF _tuilist)+refresh-preview" \
+    --bind "ctrl-p:execute-silent($SELF toggle)+refresh-preview" \
+    --bind "ctrl-s:execute-silent($SELF stop)+refresh-preview" \
+    --bind "click-footer:transform($SELF _tuiclick \"\$FZF_CLICK_FOOTER_WORD\" {1})" \
+    --bind "ctrl-t:execute($SELF _tuifocus {1})+transform($SELF _tuiafter)" \
+    --bind "ctrl-b:execute($SELF _tuirest)+transform($SELF _tuiafter)" \
+    --bind "ctrl-n:execute($SELF _tuinew)+reload($SELF _tuilist)+refresh-preview" \
+    --bind "ctrl-l:execute($SELF _tuifocus {1})+transform($SELF _tuiafter)")
+  rc=$?
+  # 130 is esc, ctrl-c, or the abort that follows a picker that already did its
+  # work — either way there is nothing left to do out here.
+  ((rc == 130)) && return 0
+  id=${out%%$'\t'*}
+  [[ -z $id ]] && return 0
+  cmd_use "$id" >/dev/null
+  cmd_start "$id"
+}
+
 # --- waybar -----------------------------------------------------------------
 
 cmd_waybar() {
@@ -1117,49 +1755,74 @@ cmd_waybar() {
   local phase task ends left text class tooltip
   IFS=$'\t' read -r phase task ends left < <(jq -r '[.phase,(.task|tostring),(.ends_at|tostring),(.left|tostring)]|@tsv' "$STATE")
 
-  local total dn sn nx over=0 prog=""
-  total=$(sess_count)
-  dn=$(sess_done_count)
-  sn=$(sess_running)
-  [[ -z $sn ]] && sn=$(sess_of_task "${task:-null}")
-  nx=$(sess_next)
-  [[ -n $sn ]] && sess_over "$sn" && over=1
-  [[ -n $sn ]] && prog=" · S$sn $(sess_focus_done "$sn")/$(sess_est "$sn")"
+  # idle_* is the whole bar when no timer runs; a running timer is just its
+  # icon and its clock.
+  local over=0 idle_text idle_class
 
-  if ((total == 0)); then
-    jq -nc '{text:"󰔛",class:"idle",tooltip:"no sessions configured — pomo s edit"}'
-    return 0
+  if ((SESSIONS)); then
+    local dn sn nx total
+    total=$(sess_count)
+    dn=$(sess_done_count)
+    sn=$(sess_running)
+    [[ -z $sn ]] && sn=$(sess_of_task "${task:-null}")
+    nx=$(sess_next)
+    if ((total == 0)); then
+      jq -nc '{text:"󰔛",class:"idle",tooltip:"no sessions configured — pomo s edit"}'
+      return 0
+    fi
+    [[ -n $sn ]] && sess_over "$sn" && over=1
+    tooltip=$(cmd_session)$'\n\n'"Click: panel · Right-click: start/pause"
+    if ((dn >= total)); then
+      idle_class=alldone
+      idle_text="󰄬"
+    elif [[ -n $(sess_running) ]]; then
+      idle_class=ready
+      idle_text="${CLOCK_OUTLINE[0]} $dn/$total"
+    else
+      idle_class=idle
+      idle_text="${CLOCK_OUTLINE[0]} $dn/$total"
+    fi
+  else
+    local ttl=""
+    [[ $task != null ]] && task_exists "$task" && ttl=$(task_title "$task")
+    tooltip=$(cmd_status)
+    tooltip+=$'\n'"$(today_count) pomodoros today · $(today_minutes)m focus"
+    if ((GOAL > 0)); then
+      local streak glyphs
+      streak=$(streak_days)
+      IFS=$'\t' read -r glyphs _ < <(streak_fire "$streak")
+      tooltip+=$'\n'"goal $(today_count)/$GOAL · ${glyphs:+$glyphs }streak ${streak}d"
+    fi
+    tooltip+=$'\n\n'"Click: panel · Right-click: start/pause · Middle: stop"
+    if [[ -n $ttl ]]; then
+      idle_class=ready
+    else
+      idle_class=idle
+    fi
+    idle_text="${CLOCK_OUTLINE[0]}"
   fi
-
-  tooltip=$(cmd_session)$'\n\n'"Click: start/pause · Right-click: menu"
-
+  local started elapsed total
+  started=$(sget '.started')
   case "$phase" in
-  work)
-    class=work
-    text="󰔟 $(fmt_clock $((ends - $(now))))$prog"
-    ;;
-  break | long)
+  work | break | long)
+    total=$((ends - started))
+    elapsed=$(($(now) - started))
     class=$phase
-    text="󰅶 $(fmt_clock $((ends - $(now))))${sn:+ · S$sn}"
+    [[ $phase == work ]] && class=work
+    text=$(clock_face "$elapsed" "$total")
+    ((BAR_TIME)) && text+=" $(bar_clock $((ends - $(now))))"
     ;;
   paused)
+    # ends_at went stale the moment we paused; .elapsed is what actually ran.
+    elapsed=$(jq -r '.elapsed // 0' "$STATE")
+    total=$((elapsed + left))
     class=paused
-    text="󰏤 $(fmt_clock "$left")${sn:+ · S$sn}"
+    text=$(clock_face "$elapsed" "$total" outline)
+    ((BAR_TIME)) && text+=" $(bar_clock "$left")"
     ;;
   *)
-    if ((dn >= total)); then
-      class=alldone
-      text="󰄬 $dn/$total · $(jq -r '.streak' "$SESS_STATE")d"
-    elif [[ -n $(sess_running) ]]; then
-      class=ready
-      text="󰔛 S$(sess_running)$prog"
-    elif [[ -n $nx ]]; then
-      class=idle
-      text="󰔛 S$nx · $dn/$total"
-    else
-      class=idle
-      text="󰔛 $dn/$total"
-    fi
+    class=$idle_class
+    text=$idle_text
     ;;
   esac
   ((over)) && {
@@ -1180,16 +1843,75 @@ cmd_status() {
   esac
 }
 
+# Everything the Omarchy shell plugin shows, in one read. The plugin polls
+# this once a second while a timer runs, so it stays one jq per file.
+cmd_json() {
+  ((SESSIONS)) && sess_roll
+  local phase task ends left started elapsed total remaining title="" streak glyphs tier
+  IFS=$'\t' read -r phase task ends left started elapsed < <(jq -r \
+    '[.phase,(.task|tostring),(.ends_at|tostring),(.left|tostring),(.started|tostring),((.elapsed // 0)|tostring)]|@tsv' "$STATE")
+  case "$phase" in
+  work | break | long)
+    total=$((ends - started))
+    elapsed=$(($(now) - started))
+    remaining=$((ends - $(now)))
+    ;;
+  paused)
+    total=$((elapsed + left))
+    remaining=$left
+    ;;
+  *)
+    total=0 elapsed=0 remaining=0
+    ;;
+  esac
+  ((remaining < 0)) && remaining=0
+  [[ $task != null ]] && task_exists "$task" && title=$(task_title "$task")
+  streak=$(streak_days)
+  IFS=$'\t' read -r glyphs _ < <(streak_fire "$streak")
+  tier=0
+  ((streak >= 1)) && tier=1
+  ((streak >= 3)) && tier=2
+  ((streak >= 7)) && tier=3
+  ((streak >= 14)) && tier=4
+  local sessions='null'
+  if ((SESSIONS)); then
+    sessions=$(jq -c '{streak, best, done:([.sessions[]|select(.status=="done")]|length), total:(.sessions|length),
+      running:([.sessions[]|select(.status=="running")|.n]|first),
+      list:[.sessions[]|{n,title,minutes,focus,status}]}' "$SESS_STATE")
+  fi
+  jq -nc \
+    --arg phase "$phase" --arg label "$(phase_label "$phase")" \
+    --argjson task "$task" --arg title "$title" \
+    --argjson total "$total" --argjson elapsed "$elapsed" --argjson remaining "$remaining" \
+    --argjson today "$(today_count)" --argjson minutes "$(today_minutes)" --argjson goal "$GOAL" \
+    --argjson streak "$streak" --arg glyphs "$glyphs" --argjson tier "$tier" \
+    --argjson work "$WORK_MIN" --argjson brk "$BREAK_MIN" \
+    --argjson sessions "$sessions" \
+    --slurpfile tasks "$TASKS" \
+    '{phase:$phase, label:$label, task:$task, title:$title,
+      total:$total, elapsed:$elapsed, remaining:$remaining,
+      today:$today, minutes:$minutes, goal:$goal,
+      streak:$streak, fire:$glyphs, tier:$tier,
+      work_min:$work, break_min:$brk, sessions:$sessions,
+      tasks:($tasks[0] | map(select(.status=="active"))
+        | sort_by(.due // 9999999999, .created)
+        | map({id, title, done, est, wmin:(.wmin // null), due:(.due // null)}))}'
+}
+
 # --- walker UI --------------------------------------------------------------
 
 walker_pick_task() {
-  local list
-  list=$(jq -r 'map(select(.status=="active"))|sort_by(.due // 9999999999,.created)|.[]|"#\(.id)  \(.title)  (\(.done)/\(.est))"' "$TASKS")
+  local list choice
+  # The id is carried in a trailing "  #<id>" that we cut back off, so a title
+  # containing "#7" cannot be mistaken for the id.
+  list=$(jq -r 'map(select(.status=="active"))|sort_by(.due // 9999999999,.created)|.[]|"\(.title)  (\(.done)/\(.est))  #\(.id)"' "$TASKS")
   [[ -z $list ]] && {
-    notify "󰔟  No tasks" "Add one with Super+Alt+T" low
+    notify "󰔟  No tasks" "Add one from the panel: Super+Alt+M" low
     return 1
   }
-  printf '%s\n' "$list" | walker -d -p "${1:-Task}" -e 2>/dev/null | grep -oP '(?<=^#)\d+'
+  choice=$(printf '%s\n' "$list" | walker -d -p "${1:-Task}" -e 2>/dev/null)
+  [[ -z $choice ]] && return 1
+  printf '%s' "${choice##*#}"
 }
 
 cmd_ui_add() {
@@ -1277,45 +1999,52 @@ cmd_ui_new() { # name + length in one flow, then start it
     notify "󰀦  Bad length" "Enter 1-600 minutes" normal
     return 1
   }
-  id=$(cmd_add "$name" -m "$mins" | grep -oE '#[0-9]+' | tr -dc '0-9')
+  id=$(cmd_add -q "$name" -m "$mins")
   [[ -z $id ]] && return 1
   cmd_use "$id" >/dev/null
   cmd_start "$id" >/dev/null
 }
 
 cmd_menu() {
-  sess_roll
-  local phase run nx choice pick
+  local phase choice
   phase=$(sget '.phase')
-  run=$(sess_running)
-  nx=$(sess_next)
+  # act maps a visible label to its action, both written at the same call site,
+  # so renaming a label can no longer detach it from what it does.
+  local -A act=()
   local -a lines=()
+  item() {
+    act["$2"]=$1
+    lines+=("$2")
+  }
   case "$phase" in
-  work | break | long) lines+=("󰏤  Pause") ;;
-  paused) lines+=("󰐊  Resume") ;;
+  work | break | long) item pause "󰏤  Pause" ;;
+  paused) item resume "󰐊  Resume" ;;
   esac
-  [[ -n $nx ]] && lines+=("󰐊  Start session $nx — $(sess_field "$nx" .title)")
-  lines+=("󰄲  Tick a task")
-  pick=${run:-$nx}
-  [[ -n $pick ]] && lines+=("󰐕  Add task to session $pick")
-  lines+=("󰃭  Today's checklist")
-  [[ -n $run ]] && lines+=("󰓛  Stop session $run")
-  lines+=("󰄬  Streak & history")
-  choice=$(printf '%s\n' "${lines[@]}" | walker -d -p "Sessions" -e 2>/dev/null)
-  case "$choice" in
-  *Pause | *Resume) cmd_toggle >/dev/null ;;
-  *"Start session"*) cmd_sess_start "$(grep -oE 'session [0-9]+' <<<"$choice" | tr -dc '0-9')" >/dev/null ;;
-  *"Tick a task"*) cmd_ui_done ;;
-  *"Add task to session"*) cmd_ui_sess_add "$(grep -oE 'session [0-9]+' <<<"$choice" | tr -dc '0-9')" ;;
-  *checklist*) notify "󰃭  Today" "$(cmd_session)" normal ;;
-  *"Stop session"*) cmd_sess_stop >/dev/null ;;
-  *Streak*) notify "󰄬  Streak" "$(cmd_streak)" normal ;;
+  item panel "󰍉  Open the panel"
+  item new "󰐕  New task + timer"
+  item pick "󰐊  Start a task"
+  item done "󰄲  Tick a task"
+  item break "󰅶  Break"
+  [[ $phase != idle ]] && item stop "󰓛  Stop"
+  item list "󰃭  Today"
+  choice=$(printf '%s\n' "${lines[@]}" | walker -d -p "Pomo" -e 2>/dev/null)
+  [[ -z $choice ]] && return 0
+  case "${act[$choice]:-}" in
+  pause | resume) cmd_toggle >/dev/null ;;
+  panel) omarchy-launch-or-focus-tui "$SELF" tui ;;
+  new) cmd_ui_new ;;
+  pick) cmd_ui_pick ;;
+  done) cmd_ui_done ;;
+  break) cmd_ui_break ;;
+  stop) cmd_stop >/dev/null ;;
+  list) notify "󰄲  Tasks" "$(cmd_ls)" normal ;;
   esac
 }
 
 # --- dispatch ---------------------------------------------------------------
 
 cmd_sess() {
+  sessions_on || return 1
   local sub=${1:-list}
   shift 2>/dev/null || true
   case "$sub" in
@@ -1339,26 +2068,24 @@ cmd_sess() {
 
 usage() {
   cat <<'USAGE'
-pomo — three sessions a day, started whenever you are ready
+pomo — a task, a timer, and one line in the waybar
 
-sessions
-  pomo                          today's checklist (same as `pomo s`)
-  pomo s start [n]              start the next unfinished session, or session n
-  pomo s stop                   halt the running session, keep its progress
-  pomo s add <title> [-s n] [-e N]
-                                add a task to a session (default: the running one)
-  pomo s done [id]              tick a task; the session closes when its list empties
-  pomo s skip [n]               mark a session missed on purpose
-  pomo s edit                   edit ~/.config/pomo/sessions.conf
-  pomo s on | off               enable/disable the background tick timer
-  pomo streak                   streak, best, and the last 14 days
+panel
+  pomo tui                      the panel: pick a task, or type a new name
+                                typing searches, it never creates
+                                enter start · ctrl-t pick the focus length
+                                ctrl-b rest · ctrl-n new task
+                                ctrl-d done · ctrl-x delete
+                                ctrl-p pause · ctrl-s stop
+  pomo menu                     the same actions as a walker list
 
-A session is finished when every task in it is ticked. Its minutes are a
-budget, not a deadline: run over and the bar turns amber, nothing stops.
+                                GOAL in config.env is the pomodoros a day needs
 
 tasks
+  pomo                          list tasks (same as `pomo ls`)
+  pomo new <title> [-m MIN]     add a task and start its timer, one step
   pomo add <title> [-e N] [-d "time"] [-m MIN]
-                                add a loose task (not attached to a session)
+                                add a task without starting it
   pomo len <id> <MIN|default>   change a task's focus length
   pomo ls [-a]                  list tasks (-a includes done)
   pomo show                     pop the task list as a notification
@@ -1367,21 +2094,30 @@ tasks
   pomo rm <id>                  delete a task (aliases: del, delete, remove)
 
 timer
-  pomo start [id] [-m MIN]      start a focus session by hand
+  pomo start [id] [-m MIN]      start a focus phase
   pomo break [-m MIN]           start a break now
   pomo pause | resume | toggle | stop | skip
   pomo status                   one-line status
   pomo report                   today + last 7 days
 
-ui (walker)
-  pomo menu                     start / tick / add / checklist / streak
-  pomo ui-new | ui-add | ui-pick | ui-done | ui-custom | ui-break
+sessions (off by default: set SESSIONS=1 in config.env)
+  pomo s                        today's checklist
+  pomo s start [n]              start the next unfinished session, or session n
+  pomo s stop                   halt the running session, keep its progress
+  pomo s add <title> [-s n] [-e N]
+                                add a task to a session
+  pomo s done [id]              tick a task; the session closes when its list empties
+  pomo s skip [n]               mark a session missed on purpose
+  pomo s edit                   edit ~/.config/pomo/sessions.conf
+  pomo s on | off               enable/disable the background tick timer
+  pomo streak                   streak, best, and the last 14 days
 
 integration
   pomo waybar                   JSON for a waybar custom module
-  pomo tick                     day roll + agenda + over-budget ping (systemd timer)
+  pomo json                     full state as JSON (the Omarchy shell plugin reads this)
   pomo nag                      idle nudge + due-task check (systemd timer)
   pomo daily                    end-of-day summary (systemd timer)
+  pomo tick                     session day-roll (systemd timer, SESSIONS=1 only)
 
 config:    ~/.config/pomo/config.env
 sessions:  ~/.config/pomo/sessions.conf
@@ -1389,7 +2125,7 @@ data:      ~/.local/share/pomo/
 USAGE
 }
 
-cmd=${1:-session}
+cmd=${1:-ls}
 shift 2>/dev/null || true
 case "$cmd" in
 s | session | sessions) cmd_sess "$@" ;;
@@ -1400,6 +2136,8 @@ sched)
   cmd_sess "$@"
   ;;
 add) cmd_add "$@" ;;
+new) cmd_new "$@" ;;
+tui) cmd_tui ;;
 ls | list) cmd_ls "$@" ;;
 use) cmd_use "$@" ;;
 done) cmd_done "$@" ;;
@@ -1415,6 +2153,7 @@ skip) cmd_skip ;;
 status) cmd_status ;;
 report) cmd_report ;;
 waybar) cmd_waybar ;;
+json) cmd_json ;;
 nag) cmd_nag ;;
 push) cmd_push "$@" ;;
 daily) cmd_daily ;;
@@ -1427,6 +2166,14 @@ ui-custom) cmd_ui_custom ;;
 ui-break) cmd_ui_break ;;
 show) cmd_show ;;
 _fire) cmd_fire ;;
+_tuilist) cmd_tui_list ;;
+_tuistatus) cmd_tui_status ;;
+_tuifocus) cmd_tui_focus "$@" ;;
+_tuirest) cmd_tui_rest ;;
+_tuinew) cmd_tui_new ;;
+_tuigo) cmd_tui_go "$@" ;;
+_tuiclick) tui_click "$@" ;;
+_tuiafter) tui_after ;;
 help | -h | --help) usage ;;
 *)
   echo "unknown command: $cmd" >&2
